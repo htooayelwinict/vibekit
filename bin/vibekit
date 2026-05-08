@@ -1090,6 +1090,7 @@ cmd_uninstall() {
   project_key="$PROJECT_DIR"
   [ "$SCOPE" = "project" ] || project_key="-"
   tmp="$(mktemp "$STATE_HOME/installed.XXXXXX")"
+  MCP_REWRITE_STATE_FILE="$(mktemp "$STATE_HOME/mcp-rewrite.XXXXXX")"
 
   while IFS='|' read -r row_pack row_tool row_scope row_project target checksum backup installed_at; do
     [ -n "${row_pack:-}" ] || continue
@@ -1100,9 +1101,29 @@ cmd_uninstall() {
         current="$(checksum_file "$target")"
         if [ "$current" = "$checksum" ]; then
           if target_has_other_records "$row_pack" "$row_tool" "$row_scope" "$row_project" "$target"; then
-            printf 'keep    %s  (used by another vibekit install)\n' "$target"
+            if is_managed_mcp_config_target "$row_pack" "$row_tool" "$row_scope" "$target"; then
+              local rebuilt
+              rebuilt="$(mktemp "$STATE_HOME/generated.XXXXXX")"
+              if write_combined_mcp_config "$row_tool" "$row_scope" "$row_project" "$target" "" "" "${row_pack#mcp-}" > "$rebuilt"; then
+                cp "$rebuilt" "$target"
+                current="$(checksum_file "$target")"
+                record_rewritten_target_checksum "$target" "$current"
+                remove_mcp_fragment "$target" "${row_pack#mcp-}"
+                printf 'update  %s\n' "$target"
+              else
+                rm "$target"
+                remove_mcp_fragment "$target" "${row_pack#mcp-}"
+                printf 'remove  %s\n' "$target"
+              fi
+              rm -f "$rebuilt"
+            else
+              printf 'keep    %s  (used by another vibekit install)\n' "$target"
+            fi
           else
             rm "$target"
+            if is_managed_mcp_config_target "$row_pack" "$row_tool" "$row_scope" "$target"; then
+              remove_mcp_fragment "$target" "${row_pack#mcp-}"
+            fi
             printf 'remove  %s\n' "$target"
           fi
         else
@@ -1119,6 +1140,9 @@ cmd_uninstall() {
   done < "$STATE_FILE"
 
   mv "$tmp" "$STATE_FILE"
+  apply_recorded_mcp_target_checksums
+  rm -f "$MCP_REWRITE_STATE_FILE"
+  MCP_REWRITE_STATE_FILE=""
 }
 
 secret_set() {
@@ -1295,7 +1319,74 @@ mcp_target_path() {
   esac
 }
 
-write_mcp_config() {
+mcp_fragment_key() {
+  local target="$1" sum size
+  set -- $(printf '%s' "$target" | cksum)
+  sum="$1"
+  size="$2"
+  [ -n "$size" ] || true
+  printf '%s' "$sum"
+}
+
+mcp_fragment_path() {
+  local target="$1" server="$2"
+  printf '%s/mcp-fragments/%s/%s' "$STATE_HOME" "$(mcp_fragment_key "$target")" "$server"
+}
+
+is_mcp_pack() {
+  case "$1" in
+    mcp-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_managed_mcp_config_target() {
+  local pack_id="$1" tool="$2" scope="$3" target="$4" expected=""
+  is_mcp_pack "$pack_id" || return 1
+  expected="$(mcp_target_path "$tool" "$scope" 2>/dev/null || true)"
+  [ -n "$expected" ] || return 1
+  [ "$expected" = "$target" ]
+}
+
+is_json_mcp_tool() {
+  case "$1" in
+    claude|opencode) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+merge_json_mcp_config() {
+  local tool="$1" current_path="$2" env_name="$3"
+  local generated
+  generated="$(mktemp "$STATE_HOME/generated-json.XXXXXX")"
+  write_mcp_config "$tool" "$env_name" > "$generated"
+  if ! perl -MJSON::PP -0777 -e '
+    my ($current_path, $generated_path, $tool) = @ARGV;
+    my $key = $tool eq "claude" ? "mcpServers" : "mcp";
+    open my $cfh, "<", $current_path or die $!;
+    local $/;
+    my $current_text = <$cfh>;
+    close $cfh;
+    open my $gfh, "<", $generated_path or die $!;
+    my $generated_text = <$gfh>;
+    close $gfh;
+    my $json = JSON::PP->new->canonical->pretty;
+    my $current = JSON::PP::decode_json($current_text);
+    my $generated = JSON::PP::decode_json($generated_text);
+    $current->{$key} = {} if ref($current->{$key}) ne "HASH";
+    my $incoming = $generated->{$key};
+    for my $server (sort keys %{$incoming}) {
+      $current->{$key}{$server} = $incoming->{$server};
+    }
+    print $json->encode($current);
+  ' "$current_path" "$generated" "$tool"; then
+    rm -f "$generated"
+    return 1
+  fi
+  rm -f "$generated"
+}
+
+write_mcp_entry() {
   local tool="$1" env_name="$2"
   local server="$MCP_ID" kind="$MCP_KIND" endpoint="$MCP_ENDPOINT" command="$MCP_COMMAND" args_csv="$MCP_ARGS_CSV" auth_scheme="$MCP_AUTH_SCHEME" header_name="$MCP_HEADER_NAME"
   if [ "$auth_scheme" = "bearer-token" ] && normalize_empty "$header_name"; then
@@ -1306,8 +1397,6 @@ write_mcp_config() {
       if [ "$kind" = "remote" ]; then
         if [ "$auth_scheme" = "header-env" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
           cat <<EOF
-{
-  "mcpServers": {
     "$server": {
       "type": "http",
       "url": "$endpoint",
@@ -1315,13 +1404,9 @@ write_mcp_config() {
         "$header_name": "\${$env_name}"
       }
     }
-  }
-}
 EOF
         elif [ "$auth_scheme" = "bearer-token" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
           cat <<EOF
-{
-  "mcpServers": {
     "$server": {
       "type": "http",
       "url": "$endpoint",
@@ -1329,32 +1414,22 @@ EOF
         "$header_name": "Bearer \${$env_name}"
       }
     }
-  }
-}
 EOF
         else
           cat <<EOF
-{
-  "mcpServers": {
     "$server": {
       "type": "http",
       "url": "$endpoint"
     }
-  }
-}
 EOF
         fi
       else
         cat <<EOF
-{
-  "mcpServers": {
     "$server": {
       "type": "stdio",
       "command": "$command",
       "args": $(csv_to_json_array "$args_csv")
     }
-  }
-}
 EOF
       fi
       ;;
@@ -1362,9 +1437,6 @@ EOF
       if [ "$kind" = "remote" ]; then
         if [ "$auth_scheme" = "header-env" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
           cat <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "mcp": {
     "$server": {
       "type": "remote",
       "url": "$endpoint",
@@ -1373,14 +1445,9 @@ EOF
         "$header_name": "{env:$env_name}"
       }
     }
-  }
-}
 EOF
         elif [ "$auth_scheme" = "bearer-token" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
           cat <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "mcp": {
     "$server": {
       "type": "remote",
       "url": "$endpoint",
@@ -1389,47 +1456,30 @@ EOF
         "$header_name": "Bearer {env:$env_name}"
       }
     }
-  }
-}
 EOF
         elif [ "$auth_scheme" = "oauth" ]; then
           cat <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "mcp": {
     "$server": {
       "type": "remote",
       "url": "$endpoint",
       "oauth": {}
     }
-  }
-}
 EOF
         else
           cat <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "mcp": {
     "$server": {
       "type": "remote",
       "url": "$endpoint"
     }
-  }
-}
 EOF
         fi
       else
         cat <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "mcp": {
     "$server": {
       "type": "local",
       "command": $(command_to_json_array "$command" "$args_csv"),
       "enabled": true
     }
-  }
-}
 EOF
       fi
       ;;
@@ -1464,6 +1514,173 @@ EOF
       fi
       ;;
   esac
+}
+
+write_mcp_config() {
+  local tool="$1" env_name="$2"
+  case "$tool" in
+    claude)
+      cat <<EOF
+{
+  "mcpServers": {
+$(write_mcp_entry "$tool" "$env_name")
+  }
+}
+EOF
+      ;;
+    opencode)
+      cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "mcp": {
+$(write_mcp_entry "$tool" "$env_name")
+  }
+}
+EOF
+      ;;
+    codex)
+      write_mcp_entry "$tool" "$env_name"
+      ;;
+  esac
+}
+
+collect_mcp_ids_for_target() {
+  local tool="$1" scope="$2" project_key="$3" target="$4" include_server="${5:-}" exclude_server="${6:-}"
+  local row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed server seen=""
+  if [ -f "$STATE_FILE" ]; then
+    while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
+      [ -n "${row_pack:-}" ] || continue
+      is_mcp_pack "$row_pack" || continue
+      [ "$row_tool" = "$tool" ] || continue
+      [ "$row_scope" = "$scope" ] || continue
+      [ "$row_project" = "$project_key" ] || continue
+      [ "$row_target" = "$target" ] || continue
+      server="${row_pack#mcp-}"
+      [ -n "$exclude_server" ] && [ "$server" = "$exclude_server" ] && continue
+      case "|$seen|" in
+        *"|$server|"*) ;;
+        *)
+          printf '%s\n' "$server"
+          seen="$seen|$server"
+          ;;
+      esac
+    done < "$STATE_FILE"
+  fi
+  if [ -n "$include_server" ] && [ "$include_server" != "$exclude_server" ]; then
+    case "|$seen|" in
+      *"|$include_server|"*) ;;
+      *) printf '%s\n' "$include_server" ;;
+    esac
+  fi
+}
+
+write_combined_mcp_config() {
+  local tool="$1" scope="$2" project_key="$3" target="$4" include_server="${5:-}" include_env_name="${6:-}" exclude_server="${7:-}"
+  local first=1 count=0 server fragment env_name entry_content
+  case "$tool" in
+    claude)
+      printf '{\n  "mcpServers": {\n'
+      ;;
+    opencode)
+      printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "mcp": {\n'
+      ;;
+  esac
+  while IFS= read -r server; do
+    [ -n "$server" ] || continue
+    if [ "$tool" = "codex" ]; then
+      [ "$count" -eq 0 ] || printf '\n'
+    else
+      [ "$first" -eq 1 ] || printf ',\n'
+    fi
+    fragment="$(mcp_fragment_path "$target" "$server")"
+    if [ -f "$fragment" ] && [ "$server" != "$include_server" ]; then
+      entry_content="$(cat "$fragment")"
+    else
+      mcp_lookup "$server" || return 1
+      env_name="$MCP_AUTH_ENV"
+      [ "$server" != "$include_server" ] || env_name="$include_env_name"
+      entry_content="$(write_mcp_entry "$tool" "$env_name")"
+    fi
+    printf '%s' "$entry_content"
+    first=0
+    count=$((count + 1))
+  done <<EOF
+$(collect_mcp_ids_for_target "$tool" "$scope" "$project_key" "$target" "$include_server" "$exclude_server")
+EOF
+  [ "$count" -gt 0 ] || return 1
+  case "$tool" in
+    claude|opencode)
+      printf '\n  }\n}\n'
+      ;;
+    codex)
+      printf '\n'
+      ;;
+  esac
+}
+
+save_mcp_fragment() {
+  local target="$1" server="$2" tool="$3" env_name="$4" path parent
+  path="$(mcp_fragment_path "$target" "$server")"
+  parent="${path%/*}"
+  mkdir -p "$parent"
+  write_mcp_entry "$tool" "$env_name" > "$path"
+}
+
+remove_mcp_fragment() {
+  local target="$1" server="$2" path parent
+  path="$(mcp_fragment_path "$target" "$server")"
+  rm -f "$path"
+  parent="${path%/*}"
+  rmdir "$parent" 2>/dev/null || true
+}
+
+update_mcp_state_checksum_for_target() {
+  local target="$1" checksum="$2"
+  local tmp row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed
+  ensure_state
+  tmp="$(mktemp "$STATE_HOME/installed.XXXXXX")"
+  while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
+    [ -n "${row_pack:-}" ] || continue
+    if is_mcp_pack "$row_pack" && [ "$row_target" = "$target" ]; then
+      row_checksum="$checksum"
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$row_pack" "$row_tool" "$row_scope" "$row_project" "$row_target" "$row_checksum" "$row_backup" "$row_installed" >> "$tmp"
+  done < "$STATE_FILE"
+  mv "$tmp" "$STATE_FILE"
+}
+
+record_rewritten_target_checksum() {
+  local target="$1" checksum="$2"
+  [ -n "${MCP_REWRITE_STATE_FILE:-}" ] || return 1
+  printf '%s|%s\n' "$target" "$checksum" >> "$MCP_REWRITE_STATE_FILE"
+}
+
+rewritten_target_checksum() {
+  local target="$1" recorded_target checksum
+  [ -n "${MCP_REWRITE_STATE_FILE:-}" ] || return 1
+  [ -f "$MCP_REWRITE_STATE_FILE" ] || return 1
+  while IFS='|' read -r recorded_target checksum; do
+    [ "$recorded_target" = "$target" ] || continue
+    printf '%s' "$checksum"
+    return 0
+  done < "$MCP_REWRITE_STATE_FILE"
+  return 1
+}
+
+apply_recorded_mcp_target_checksums() {
+  local tmp row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed new_checksum
+  [ -n "${MCP_REWRITE_STATE_FILE:-}" ] || return 0
+  [ -s "$MCP_REWRITE_STATE_FILE" ] || return 0
+  tmp="$(mktemp "$STATE_HOME/installed.XXXXXX")"
+  while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
+    [ -n "${row_pack:-}" ] || continue
+    if is_mcp_pack "$row_pack"; then
+      new_checksum="$(rewritten_target_checksum "$row_target" 2>/dev/null || true)"
+      [ -z "$new_checksum" ] || row_checksum="$new_checksum"
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$row_pack" "$row_tool" "$row_scope" "$row_project" "$row_target" "$row_checksum" "$row_backup" "$row_installed" >> "$tmp"
+  done < "$STATE_FILE"
+  mv "$tmp" "$STATE_FILE"
 }
 
 manual_mcp_hint() {
@@ -1506,26 +1723,44 @@ manual_mcp_hint() {
 
 install_generated_file() {
   local pack_id="$1" tool="$2" scope="$3" dst="$4" project_key="$5" generator_tool="$6" env_name="$7"
-  local tmp parent current tracked_checksum="" row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed
+  local tmp parent current tracked_checksum="" managed_target_checksum="" row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed merged_existing=0
   tmp="$(mktemp "$STATE_HOME/generated.XXXXXX")"
-  write_mcp_config "$generator_tool" "$env_name" > "$tmp"
 
   if [ -e "$dst" ]; then
     while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
+      if is_mcp_pack "$row_pack" && [ "$row_tool" = "$tool" ] && [ "$row_scope" = "$scope" ] && [ "$row_project" = "$project_key" ] && [ "$row_target" = "$dst" ]; then
+        managed_target_checksum="$row_checksum"
+      fi
       if [ "$row_pack" = "$pack_id" ] && [ "$row_tool" = "$tool" ] && [ "$row_scope" = "$scope" ] && [ "$row_project" = "$project_key" ] && [ "$row_target" = "$dst" ]; then
         tracked_checksum="$row_checksum"
       fi
     done < "$STATE_FILE"
     if [ -z "$tracked_checksum" ]; then
-      manual_mcp_hint "$tool" "$env_name"
-      rm -f "$tmp"
-      return 0
+      if [ -n "$managed_target_checksum" ] && is_managed_mcp_config_target "$pack_id" "$tool" "$scope" "$dst"; then
+        tracked_checksum="$managed_target_checksum"
+      elif is_json_mcp_tool "$generator_tool" && is_managed_mcp_config_target "$pack_id" "$tool" "$scope" "$dst" && merge_json_mcp_config "$generator_tool" "$dst" "$env_name" > "$tmp"; then
+        merged_existing=1
+      else
+        manual_mcp_hint "$tool" "$env_name"
+        rm -f "$tmp"
+        return 0
+      fi
     fi
     current="$(checksum_file "$dst")"
     if [ "$current" != "$tracked_checksum" ] && [ "$FORCE" -ne 1 ]; then
-      printf 'skip    %s  (changed since vibekit install; use --force to overwrite)\n' "$dst"
-      rm -f "$tmp"
-      return 0
+      if is_json_mcp_tool "$generator_tool" && is_managed_mcp_config_target "$pack_id" "$tool" "$scope" "$dst" && merge_json_mcp_config "$generator_tool" "$dst" "$env_name" > "$tmp"; then
+        merged_existing=1
+      else
+        printf 'skip    %s  (changed since vibekit install; use --force to overwrite)\n' "$dst"
+        rm -f "$tmp"
+        return 0
+      fi
+    fi
+  fi
+
+  if [ "$merged_existing" -ne 1 ]; then
+    if ! write_combined_mcp_config "$generator_tool" "$scope" "$project_key" "$dst" "$MCP_ID" "$env_name" > "$tmp"; then
+      write_mcp_config "$generator_tool" "$env_name" > "$tmp"
     fi
   fi
 
@@ -1535,6 +1770,8 @@ install_generated_file() {
   ALLOW_TRACKED_OVERWRITE=1
   install_file "$pack_id" "$tool" "$scope" "$tmp" "$dst" "$project_key"
   ALLOW_TRACKED_OVERWRITE="$old_allow"
+  update_mcp_state_checksum_for_target "$dst" "$(checksum_file "$dst")"
+  save_mcp_fragment "$dst" "$MCP_ID" "$generator_tool" "$env_name"
   rm -f "$tmp"
 }
 
@@ -1577,7 +1814,9 @@ cmd_mcp_install() {
       if [ "$mode" = "diff" ]; then
         local tmp
         tmp="$(mktemp "/tmp/vibekit-mcp.XXXXXX")"
-        write_mcp_config "$tool" "$env_name" > "$tmp"
+        if ! write_combined_mcp_config "$tool" "$SCOPE" "$project_key" "$dst" "$MCP_ID" "$env_name" > "$tmp"; then
+          write_mcp_config "$tool" "$env_name" > "$tmp"
+        fi
         plan_action "$pack_id" "$tmp" "$dst"
         rm -f "$tmp"
       else
