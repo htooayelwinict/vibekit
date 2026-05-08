@@ -1,0 +1,23 @@
+# vibekit:pack=core-vibe-coder
+# Conservative command policy examples for Codex.
+
+prefix_rule(
+    pattern = ["git", "status"],
+    decision = "allow",
+    justification = "Reading repository status is safe and useful for context.",
+    match = ["git status", "git status --short"],
+)
+
+prefix_rule(
+    pattern = ["git", "diff"],
+    decision = "allow",
+    justification = "Reading diffs is safe and useful for review.",
+    match = ["git diff", "git diff --stat"],
+)
+
+prefix_rule(
+    pattern = ["git", "push"],
+    decision = "prompt",
+    justification = "Pushing changes should require explicit user approval.",
+    match = ["git push"],
+)

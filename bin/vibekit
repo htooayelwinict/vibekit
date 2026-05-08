@@ -1,0 +1,1644 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VK_VERSION="0.1.0"
+VK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+PACKS_DIR="$VK_ROOT/packs"
+MCP_REGISTRY="$VK_ROOT/mcp/registry.psv"
+MCP_SKILLS_DIR="$VK_ROOT/mcp/skills"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/vibekit"
+STATE_FILE="$STATE_HOME/installed.tsv"
+SECRETS_FILE="$STATE_HOME/secrets.env"
+LOCK_DIR="$STATE_HOME/lock"
+
+PROJECT_DIR="$(pwd -P)"
+TOOLS="claude,opencode,codex"
+SCOPE="project"
+FORCE=0
+YES=0
+API_KEY_ENV=""
+ALLOW_TRACKED_OVERWRITE=0
+LOCK_HELD=0
+
+die() {
+  printf 'vibekit: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+vibekit 0.1.0
+
+CLI-first setup manager for coding assistants.
+
+Usage:
+  vibekit detect
+  vibekit doctor [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR]
+  vibekit self status [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR]
+  vibekit self install [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR] [--force]
+  vibekit self uninstall [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR]
+  vibekit status [--tools claude,opencode,codex] [--scope project|global]
+  vibekit list [packs|mcps]
+  vibekit diff [pack] [--tools claude,opencode,codex] [--scope project|global]
+  vibekit install [pack] [--tools claude,opencode,codex] [--scope project|global] [--force]
+  vibekit uninstall [pack] [--tools claude,opencode,codex] [--scope project|global]
+  vibekit mcp list
+  vibekit mcp diff <server> [--tools claude,opencode,codex] [--scope project|global]
+  vibekit mcp install <server> [--tools claude,opencode,codex] [--scope project|global]
+  vibekit mcp uninstall <server> [--tools claude,opencode,codex] [--scope project|global]
+  vibekit secrets set <NAME> [--value VALUE]
+
+Defaults:
+  pack:  core-vibe-coder
+  tools: claude,opencode,codex
+  scope: project
+
+Safety:
+  diff is read-only.
+  install skips existing user files unless --force is passed.
+  uninstall only removes files whose checksum still matches vibekit's install record.
+USAGE
+}
+
+ensure_state() {
+  mkdir -p "$STATE_HOME"
+  chmod 700 "$STATE_HOME" 2>/dev/null || true
+  [ -f "$STATE_FILE" ] || : > "$STATE_FILE"
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+}
+
+release_lock() {
+  if [ "${LOCK_HELD:-0}" -eq 1 ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+  fi
+}
+
+acquire_lock() {
+  [ "${LOCK_HELD:-0}" -eq 1 ] && return 0
+  mkdir -p "$STATE_HOME"
+  local tries=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 100 ]; then
+      die "state lock is busy: $LOCK_DIR"
+    fi
+    sleep 0.1
+  done
+  LOCK_HELD=1
+  trap release_lock EXIT INT TERM
+}
+
+checksum_file() {
+  local path="$1"
+  local sum size rest
+  set -- $(cksum "$path")
+  sum="$1"
+  size="$2"
+  rest="${3:-}"
+  [ -n "$rest" ] || true
+  printf '%s:%s' "$sum" "$size"
+}
+
+has_marker() {
+  local path="$1" pack="$2"
+  grep -q "vibekit:pack=$pack" "$path" 2>/dev/null
+}
+
+first_line() {
+  local line
+  IFS= read -r line || true
+  printf '%s' "$line"
+}
+
+command_version() {
+  local cmd="$1"
+  "$cmd" --version 2>/dev/null | first_line
+}
+
+default_bin_dir() {
+  printf '%s/.local/bin' "$HOME"
+}
+
+normalize_shell_name() {
+  case "$1" in
+    auto|"") printf 'auto' ;;
+    zsh|bash|fish|nu|pwsh) printf '%s' "$1" ;;
+    nushell) printf 'nu' ;;
+    powershell|powershell.exe|pwsh.exe) printf 'pwsh' ;;
+    */zsh) printf 'zsh' ;;
+    */bash) printf 'bash' ;;
+    */fish) printf 'fish' ;;
+    */nu) printf 'nu' ;;
+    */pwsh) printf 'pwsh' ;;
+    *) return 1 ;;
+  esac
+}
+
+current_shell_name() {
+  if ! normalize_shell_name "$SHELL"; then
+    printf 'bash'
+  fi
+}
+
+shell_label() {
+  case "$1" in
+    zsh) printf 'zsh' ;;
+    bash) printf 'bash' ;;
+    fish) printf 'fish' ;;
+    nu) printf 'nushell' ;;
+    pwsh) printf 'powershell' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+default_shell_rc_file() {
+  local shell_name
+  shell_name="$(normalize_shell_name "${1:-auto}" 2>/dev/null || printf 'auto')"
+  [ "$shell_name" = "auto" ] && shell_name="$(current_shell_name)"
+  case "$shell_name" in
+    zsh) printf '%s/.zprofile' "$HOME" ;;
+    bash)
+      if [ -f "$HOME/.bash_profile" ] || [ ! -f "$HOME/.profile" ]; then
+        printf '%s/.bash_profile' "$HOME"
+      else
+        printf '%s/.profile' "$HOME"
+      fi
+      ;;
+    fish) printf '%s/fish/config.fish' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+    nu) printf '%s/nushell/config.nu' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+    pwsh) printf '%s/.config/powershell/Microsoft.PowerShell_profile.ps1' "$HOME" ;;
+    *) printf '%s/.profile' "$HOME" ;;
+  esac
+}
+
+shell_path_snippet() {
+  local shell_name="$1" bin_dir="$2"
+  case "$shell_name" in
+    zsh|bash)
+      printf '# vibekit:path\nexport PATH="%s:$PATH"\n' "$bin_dir"
+      ;;
+    fish)
+      printf '# vibekit:path\nfish_add_path %q\n' "$bin_dir"
+      ;;
+    nu)
+      printf '# vibekit:path\n$env.path ++= [%q]\n' "$bin_dir"
+      ;;
+    pwsh)
+      printf '# vibekit:path\n$env:PATH = "%s" + [System.IO.Path]::PathSeparator + $env:PATH\n' "$bin_dir"
+      ;;
+    *)
+      printf '# vibekit:path\nexport PATH="%s:$PATH"\n' "$bin_dir"
+      ;;
+  esac
+}
+
+shell_reload_hint() {
+  case "$1" in
+    zsh) printf 'exec zsh -l' ;;
+    bash) printf 'exec bash -l' ;;
+    fish) printf 'exec fish -l' ;;
+    nu) printf 'exec nu -l' ;;
+    pwsh) printf 'exec pwsh -l' ;;
+    *) printf 'exec "%s" -l' "${SHELL:-/bin/sh}" ;;
+  esac
+}
+
+self_status_command() {
+  local shell_name="$1" bin_dir="$2"
+  case "$shell_name" in
+    zsh)
+      printf 'zsh -lic %q' "command -v vibekit >/dev/null 2>&1 && case ":\$PATH:" in *":$bin_dir:"*) printf ok ;; *) printf missing ;; esac"
+      ;;
+    bash)
+      printf 'bash -lic %q' "command -v vibekit >/dev/null 2>&1 && case ":\$PATH:" in *":$bin_dir:"*) printf ok ;; *) printf missing ;; esac"
+      ;;
+    fish)
+      printf 'fish -lic %q' "command -q vibekit; and contains -- $bin_dir \$PATH; and printf ok"
+      ;;
+    nu)
+      printf 'nu -l -c %q' "if ('vibekit' in ((which vibekit | get command?) | default [])) and ($env.path | any {|p| $p == '$bin_dir'}) { print ok } else { print missing }"
+      ;;
+    pwsh)
+      printf 'pwsh -NoLogo -NoProfile -Command %q' 'if ((Get-Command vibekit -ErrorAction SilentlyContinue) -and ($env:PATH -split [IO.Path]::PathSeparator | Where-Object { $_ -eq '"'"$bin_dir"'"' })) { Write-Output ok }'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+fresh_shell_status_command() {
+  local shell_name="$1" bin_dir="$2"
+  case "$shell_name" in
+    zsh)
+      printf 'zsh -lic %q' 'command -v vibekit >/dev/null 2>&1 && printf __VK_OK__ || printf __VK_MISSING__'
+      ;;
+    bash)
+      printf 'bash -lic %q' 'command -v vibekit >/dev/null 2>&1 && printf __VK_OK__ || printf __VK_MISSING__'
+      ;;
+    fish)
+      printf 'fish -lic %q' 'if command -q vibekit; printf __VK_OK__; else; printf __VK_MISSING__; end'
+      ;;
+    nu)
+      printf 'nu -l -c %q' "if ('vibekit' in ((which vibekit | get command?) | default [])) { print __VK_OK__ } else { print __VK_MISSING__ }"
+      ;;
+    pwsh)
+      printf 'pwsh -NoLogo -Command %q' 'if (Get-Command vibekit -ErrorAction SilentlyContinue) { Write-Output __VK_OK__ } else { Write-Output __VK_MISSING__ }'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+self_runtime_base_dir() {
+  printf '%s/vibekit/self' "${XDG_DATA_HOME:-$HOME/.local/share}"
+}
+
+self_target_path() {
+  local bin_dir="$1"
+  printf '%s/vibekit' "$bin_dir"
+}
+
+self_install_id() {
+  local target="$1" sum size
+  set -- $(printf '%s' "$target" | cksum)
+  sum="$1"
+  size="$2"
+  [ -n "$size" ] || true
+  printf '%s' "$sum"
+}
+
+self_runtime_root() {
+  local target="$1"
+  printf '%s/%s' "$(self_runtime_base_dir)" "$(self_install_id "$target")"
+}
+
+self_runtime_script_path() {
+  local runtime_root="$1"
+  printf '%s/bin/vibekit' "$runtime_root"
+}
+
+self_runtime_metadata_path() {
+  local runtime_root="$1"
+  printf '%s/.vibekit-self-install' "$runtime_root"
+}
+
+path_has_dir() {
+  case ":$PATH:" in
+    *":$1:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+self_marker_value() {
+  local path="$1" key="$2" line
+  [ -f "$path" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "# vibekit:self-install $key="*)
+        printf '%s' "${line#\# vibekit:self-install $key=}"
+        return 0
+        ;;
+    esac
+  done < "$path"
+  return 1
+}
+
+self_marker_source() {
+  self_marker_value "$1" source
+}
+
+self_marker_runtime() {
+  self_marker_value "$1" runtime
+}
+
+self_runtime_metadata_value() {
+  local runtime_root="$1" key="$2" line path
+  path="$(self_runtime_metadata_path "$runtime_root")"
+  [ -f "$path" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "$key="*)
+        printf '%s' "${line#$key=}"
+        return 0
+        ;;
+    esac
+  done < "$path"
+  return 1
+}
+
+detect_self_target_path() {
+  local resolved="" runtime_target=""
+  if command -v vibekit >/dev/null 2>&1; then
+    resolved="$(command -v vibekit)"
+    if is_self_managed_target "$resolved"; then
+      printf '%s' "$resolved"
+      return 0
+    fi
+  fi
+  if [ -d "$VK_ROOT" ] && is_self_managed_runtime "$VK_ROOT"; then
+    runtime_target="$(self_runtime_metadata_value "$VK_ROOT" target 2>/dev/null || true)"
+    if [ -n "$runtime_target" ]; then
+      printf '%s' "$runtime_target"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+is_self_managed_target() {
+  local path="$1"
+  self_marker_source "$path" >/dev/null 2>&1
+}
+
+is_self_managed_runtime() {
+  local runtime_root="$1"
+  self_runtime_metadata_value "$runtime_root" source >/dev/null 2>&1
+}
+
+note_bin_dir_path() {
+  local bin_dir="$1"
+  if path_has_dir "$bin_dir"; then
+    printf 'path    %s is already on PATH\n' "$bin_dir"
+  else
+    printf 'note    add %s to PATH\n' "$bin_dir"
+    printf '        export PATH="%s:$PATH"\n' "$bin_dir"
+  fi
+}
+
+shell_rc_has_bin_dir() {
+  local rc_file="$1" bin_dir="$2"
+  [ -f "$rc_file" ] || return 1
+  grep -Fq "$bin_dir" "$rc_file" 2>/dev/null
+}
+
+shell_rc_contains_path_export() {
+  local rc_file="$1" bin_dir="$2"
+  shell_rc_has_bin_dir "$rc_file" "$bin_dir"
+}
+
+ensure_shell_rc_has_bin_dir() {
+  local rc_file="$1" shell_name="$2" bin_dir="$3" snippet
+  [ -n "$rc_file" ] || return 1
+  if shell_rc_has_bin_dir "$rc_file" "$bin_dir"; then
+    printf 'shell   %s already references %s\n' "$rc_file" "$bin_dir"
+    return 0
+  fi
+  if [ -e "$rc_file" ] && ! [ -f "$rc_file" ]; then
+    printf 'note    cannot update non-file shell config: %s\n' "$rc_file"
+    return 1
+  fi
+  mkdir -p "${rc_file%/*}"
+  [ -f "$rc_file" ] || : > "$rc_file"
+  snippet="$(shell_path_snippet "$shell_name" "$bin_dir")"
+  printf '\n%s' "$snippet" >> "$rc_file"
+  printf 'shell   updated %s\n' "$rc_file"
+  return 0
+}
+
+detect_one() {
+  local name="$1" cmd="$2" config="$3"
+  local version=""
+  if command -v "$cmd" >/dev/null 2>&1; then
+    version="$(command_version "$cmd" || true)"
+    [ -n "$version" ] || version="installed"
+    printf '%-10s installed  %s\n' "$name" "$version"
+  else
+    printf '%-10s missing\n' "$name"
+  fi
+
+  if [ -e "$config" ]; then
+    printf '           config: %s\n' "$config"
+  else
+    printf '           config: not found (%s)\n' "$config"
+  fi
+}
+
+cmd_detect() {
+  printf 'Tools\n'
+  detect_one "claude" "claude" "$HOME/.claude"
+  detect_one "opencode" "opencode" "${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+  detect_one "codex" "codex" "$HOME/.codex"
+}
+
+cmd_doctor() {
+  local shell_name="auto" effective_shell bin_dir="" explicit_bin_dir=0 detected_target=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --shell)
+        [ "$#" -ge 2 ] || die "--shell requires a value"
+        shell_name="$2"
+        shift 2
+        ;;
+      --bin-dir)
+        [ "$#" -ge 2 ] || die "--bin-dir requires a value"
+        bin_dir="$2"
+        explicit_bin_dir=1
+        shift 2
+        ;;
+      *) die "usage: vibekit doctor [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR]" ;;
+    esac
+  done
+
+  effective_shell="$(normalize_shell_name "$shell_name" 2>/dev/null || die "unsupported shell: $shell_name")"
+  [ "$effective_shell" = "auto" ] && effective_shell="$(current_shell_name)"
+
+  if [ "$explicit_bin_dir" -ne 1 ] && detected_target="$(detect_self_target_path 2>/dev/null)"; then
+    bin_dir="${detected_target%/*}"
+  fi
+  [ -n "$bin_dir" ] || bin_dir="$(default_bin_dir)"
+
+  cmd_detect
+  printf '\nState\n'
+  printf '  state dir: %s\n' "$STATE_HOME"
+  printf '  installs:  %s\n' "$STATE_FILE"
+  printf '  secrets:   %s\n' "$SECRETS_FILE"
+  printf '\nSelf Install\n'
+  cmd_self_status --shell "$effective_shell" --bin-dir "$bin_dir"
+  printf '\nPacks\n'
+  cmd_list_packs
+}
+
+cmd_self_status() {
+  local shell_name="auto" effective_shell bin_dir="" explicit_bin_dir=0 target runtime_root installed_source="" installed_runtime="" runtime_source="" resolved="" rc_file fresh_cmd fresh_status="" detected_target=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --shell)
+        [ "$#" -ge 2 ] || die "--shell requires a value"
+        shell_name="$2"
+        shift 2
+        ;;
+      --bin-dir)
+        [ "$#" -ge 2 ] || die "--bin-dir requires a value"
+        bin_dir="$2"
+        explicit_bin_dir=1
+        shift 2
+        ;;
+      *) die "usage: vibekit self status [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR]" ;;
+    esac
+  done
+
+  effective_shell="$(normalize_shell_name "$shell_name" 2>/dev/null || die "unsupported shell: $shell_name")"
+  [ "$effective_shell" = "auto" ] && effective_shell="$(current_shell_name)"
+
+  if [ "$explicit_bin_dir" -ne 1 ] && detected_target="$(detect_self_target_path 2>/dev/null)"; then
+    bin_dir="${detected_target%/*}"
+  fi
+  [ -n "$bin_dir" ] || bin_dir="$(default_bin_dir)"
+
+  target="$(self_target_path "$bin_dir")"
+  runtime_root="$(self_runtime_root "$target")"
+  printf 'source   %s/bin/vibekit\n' "$VK_ROOT"
+  printf 'target   %s\n' "$target"
+
+  if [ -e "$target" ]; then
+    if installed_source="$(self_marker_source "$target" 2>/dev/null)"; then
+      printf 'status   installed\n'
+      printf 'managed  yes\n'
+      printf 'from     %s\n' "$installed_source"
+      installed_runtime="$(self_marker_runtime "$target" 2>/dev/null || true)"
+      [ -z "$installed_runtime" ] || runtime_root="$installed_runtime"
+    else
+      printf 'status   present\n'
+      printf 'managed  no\n'
+    fi
+  else
+    printf 'status   missing\n'
+    printf 'managed  no\n'
+  fi
+
+  printf 'runtime  %s\n' "$runtime_root"
+  if [ -d "$runtime_root" ] && is_self_managed_runtime "$runtime_root"; then
+    runtime_source="$(self_runtime_metadata_value "$runtime_root" source 2>/dev/null || true)"
+    printf 'runtime-status  installed\n'
+    printf 'runtime-managed yes\n'
+    [ -z "$runtime_source" ] || printf 'runtime-from    %s\n' "$runtime_source"
+  elif [ -e "$runtime_root" ]; then
+    printf 'runtime-status  present\n'
+    printf 'runtime-managed no\n'
+  else
+    printf 'runtime-status  missing\n'
+    printf 'runtime-managed no\n'
+  fi
+
+  if command -v vibekit >/dev/null 2>&1; then
+    resolved="$(command -v vibekit)"
+    printf 'command  %s\n' "$resolved"
+  else
+    printf 'command  not on PATH\n'
+  fi
+
+  printf 'shell-type    %s\n' "$(shell_label "$effective_shell")"
+  rc_file="$(default_shell_rc_file "$effective_shell")"
+  printf 'shell-config  %s\n' "$rc_file"
+  if shell_rc_contains_path_export "$rc_file" "$bin_dir"; then
+    printf 'shell-path    configured\n'
+  else
+    printf 'shell-path    missing\n'
+  fi
+
+  if ! command -v "$effective_shell" >/dev/null 2>&1; then
+    printf 'fresh-shell   unavailable\n'
+  elif fresh_cmd="$(fresh_shell_status_command "$effective_shell" "$bin_dir" 2>/dev/null)"; then
+    fresh_status="$(eval "$fresh_cmd" 2>/dev/null || true)"
+    case "$fresh_status" in
+      *__VK_OK__*) printf 'fresh-shell   ok\n' ;;
+      *__VK_MISSING__*) printf 'fresh-shell   missing\n' ;;
+      *) printf 'fresh-shell   unknown\n' ;;
+    esac
+  else
+    printf 'fresh-shell   unsupported\n'
+  fi
+
+  note_bin_dir_path "$bin_dir"
+}
+
+cmd_self_install() {
+  local bin_dir="" explicit_bin_dir=0 target runtime_root runtime_script runtime_parent runtime_tmp launcher_tmp
+  local shell_name="auto" effective_shell source_script backup_path="" runtime_backup_path="" existing_source="" existing_runtime="" force=0 now rc_file detected_target=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --shell)
+        [ "$#" -ge 2 ] || die "--shell requires a value"
+        shell_name="$2"
+        shift 2
+        ;;
+      --bin-dir)
+        [ "$#" -ge 2 ] || die "--bin-dir requires a value"
+        bin_dir="$2"
+        explicit_bin_dir=1
+        shift 2
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      *) die "usage: vibekit self install [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR] [--force]" ;;
+    esac
+  done
+
+  effective_shell="$(normalize_shell_name "$shell_name" 2>/dev/null || die "unsupported shell: $shell_name")"
+  [ "$effective_shell" = "auto" ] && effective_shell="$(current_shell_name)"
+
+  if [ "$explicit_bin_dir" -ne 1 ] && detected_target="$(detect_self_target_path 2>/dev/null)"; then
+    bin_dir="${detected_target%/*}"
+  fi
+  [ -n "$bin_dir" ] || bin_dir="$(default_bin_dir)"
+
+  target="$(self_target_path "$bin_dir")"
+  runtime_root="$(self_runtime_root "$target")"
+  runtime_script="$(self_runtime_script_path "$runtime_root")"
+  runtime_parent="${runtime_root%/*}"
+  source_script="$VK_ROOT/bin/vibekit"
+
+  mkdir -p "$runtime_parent"
+  runtime_tmp="$(mktemp -d "$runtime_parent/install.XXXXXX")"
+  cp -R "$VK_ROOT/bin" "$runtime_tmp/bin"
+  cp -R "$VK_ROOT/packs" "$runtime_tmp/packs"
+  cp -R "$VK_ROOT/mcp" "$runtime_tmp/mcp"
+  chmod 755 "$runtime_tmp/bin/vibekit"
+
+  now="$(date +%Y%m%d-%H%M%S)"
+  {
+    printf 'source=%s\n' "$source_script"
+    printf 'installed_at=%s\n' "$now"
+    printf 'version=%s\n' "$VK_VERSION"
+    printf 'target=%s\n' "$target"
+  } > "$(self_runtime_metadata_path "$runtime_tmp")"
+
+  launcher_tmp="$(mktemp "${TMPDIR:-/tmp}/vibekit-launcher.XXXXXX")"
+  printf '#!/usr/bin/env bash\n' > "$launcher_tmp"
+  printf '# vibekit:self-install source=%s\n' "$source_script" >> "$launcher_tmp"
+  printf '# vibekit:self-install runtime=%s\n' "$runtime_root" >> "$launcher_tmp"
+  printf 'exec %q "$@"\n' "$runtime_script" >> "$launcher_tmp"
+  chmod 755 "$launcher_tmp"
+
+  if [ -e "$target" ]; then
+    if ! existing_source="$(self_marker_source "$target" 2>/dev/null)"; then
+      if [ "$force" -ne 1 ]; then
+        rm -rf "$runtime_tmp"
+        rm -f "$launcher_tmp"
+        die "target exists and is not vibekit-managed: $target (use --force to overwrite)"
+      fi
+    fi
+    if ! cmp -s "$launcher_tmp" "$target"; then
+      backup_path="$target.bak.$now"
+      cp "$target" "$backup_path"
+      printf 'backup  %s\n' "$backup_path"
+      [ -z "$existing_source" ] || printf 'update  %s\n' "$target"
+    fi
+    existing_runtime="$(self_marker_runtime "$target" 2>/dev/null || true)"
+    [ -z "$existing_runtime" ] || runtime_root="$existing_runtime"
+  fi
+
+  if [ -e "$runtime_root" ]; then
+    if ! is_self_managed_runtime "$runtime_root" && [ "$force" -ne 1 ]; then
+      rm -rf "$runtime_tmp"
+      rm -f "$launcher_tmp"
+      die "runtime exists and is not vibekit-managed: $runtime_root (use --force to overwrite)"
+    fi
+    runtime_backup_path="$runtime_root.bak.$now"
+    mv "$runtime_root" "$runtime_backup_path"
+    printf 'backup  %s\n' "$runtime_backup_path"
+  fi
+
+  mkdir -p "$bin_dir"
+  mv "$runtime_tmp" "$runtime_root"
+  printf 'sync    %s\n' "$runtime_root"
+
+  if [ ! -e "$target" ] || ! cmp -s "$launcher_tmp" "$target"; then
+    mv "$launcher_tmp" "$target"
+    chmod 755 "$target"
+    printf 'write   %s\n' "$target"
+  else
+    rm -f "$launcher_tmp"
+    printf 'same    %s\n' "$target"
+  fi
+
+  rc_file="$(default_shell_rc_file "$effective_shell")"
+  ensure_shell_rc_has_bin_dir "$rc_file" "$effective_shell" "$bin_dir" || true
+  printf 'shell   %s\n' "$(shell_label "$effective_shell")"
+  note_bin_dir_path "$bin_dir"
+  printf 'reload  %s\n' "$(shell_reload_hint "$effective_shell")"
+  printf 'run     vibekit doctor\n'
+}
+
+cmd_self_uninstall() {
+  local shell_name="auto" effective_shell bin_dir="" explicit_bin_dir=0 target runtime_root installed_runtime="" detected_target=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --shell)
+        [ "$#" -ge 2 ] || die "--shell requires a value"
+        shell_name="$2"
+        shift 2
+        ;;
+      --bin-dir)
+        [ "$#" -ge 2 ] || die "--bin-dir requires a value"
+        bin_dir="$2"
+        explicit_bin_dir=1
+        shift 2
+        ;;
+      *) die "usage: vibekit self uninstall [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR]" ;;
+    esac
+  done
+
+  effective_shell="$(normalize_shell_name "$shell_name" 2>/dev/null || die "unsupported shell: $shell_name")"
+  [ "$effective_shell" = "auto" ] && effective_shell="$(current_shell_name)"
+
+  if [ "$explicit_bin_dir" -ne 1 ] && detected_target="$(detect_self_target_path 2>/dev/null)"; then
+    bin_dir="${detected_target%/*}"
+  fi
+  [ -n "$bin_dir" ] || bin_dir="$(default_bin_dir)"
+
+  target="$(self_target_path "$bin_dir")"
+  runtime_root="$(self_runtime_root "$target")"
+  if [ ! -e "$target" ]; then
+    printf 'gone    %s\n' "$target"
+  elif ! is_self_managed_target "$target"; then
+    die "refusing to remove non-vibekit-managed target: $target"
+  else
+    installed_runtime="$(self_marker_runtime "$target" 2>/dev/null || true)"
+    [ -z "$installed_runtime" ] || runtime_root="$installed_runtime"
+    rm "$target"
+    printf 'remove  %s\n' "$target"
+  fi
+
+  if [ ! -e "$runtime_root" ]; then
+    printf 'gone    %s\n' "$runtime_root"
+    return 0
+  fi
+  if ! is_self_managed_runtime "$runtime_root"; then
+    die "refusing to remove non-vibekit-managed runtime: $runtime_root"
+  fi
+  rm -rf "$runtime_root"
+  printf 'remove  %s\n' "$runtime_root"
+  printf 'shell   %s\n' "$(shell_label "$effective_shell")"
+}
+
+cmd_self() {
+  local sub="${1:-status}"
+  shift || true
+  case "$sub" in
+    status) cmd_self_status "$@" ;;
+    install) cmd_self_install "$@" ;;
+    uninstall) cmd_self_uninstall "$@" ;;
+    *) die "usage: vibekit self [status|install|uninstall] [--shell auto|zsh|bash|fish|nu|pwsh] [--bin-dir DIR] [--force]" ;;
+  esac
+}
+
+cmd_status() {
+  parse_common_options "$@"
+  split_tools
+  ensure_state
+
+  local project_key row_pack row_tool row_scope row_project target checksum backup installed_at current matched=0 state=""
+  project_key="$PROJECT_DIR"
+  [ "$SCOPE" = "project" ] || project_key="-"
+
+  while IFS='|' read -r row_pack row_tool row_scope row_project target checksum backup installed_at; do
+    [ -n "${row_pack:-}" ] || continue
+    if [ "$row_scope" = "$SCOPE" ] && [ "$row_project" = "$project_key" ] && tool_selected "$row_tool"; then
+      matched=1
+      if [ ! -e "$target" ]; then
+        state="missing"
+      else
+        current="$(checksum_file "$target")"
+        if [ "$current" = "$checksum" ]; then
+          state="ok"
+        else
+          state="changed"
+        fi
+      fi
+      printf '%-8s %-18s %-8s %s\n' "$state" "$row_pack" "$row_tool" "$target"
+    fi
+  done < "$STATE_FILE"
+
+  [ "$matched" -eq 1 ] || printf 'No vibekit-managed files for %s scope in %s.\n' "$SCOPE" "$PROJECT_DIR"
+}
+
+cmd_list_packs() {
+  local pack_dir pack_id pack_name pack_version pack_description
+  for pack_dir in "$PACKS_DIR"/*; do
+    [ -d "$pack_dir" ] || continue
+    pack_id="${pack_dir##*/}"
+    pack_name="$pack_id"
+    pack_version="unknown"
+    pack_description=""
+    if [ -f "$pack_dir/pack.env" ]; then
+      PACK_ID=""
+      PACK_NAME=""
+      PACK_VERSION=""
+      PACK_DESCRIPTION=""
+      # shellcheck disable=SC1090
+      . "$pack_dir/pack.env"
+      pack_id="${PACK_ID:-$pack_id}"
+      pack_name="${PACK_NAME:-$pack_name}"
+      pack_version="${PACK_VERSION:-unknown}"
+      pack_description="${PACK_DESCRIPTION:-}"
+    fi
+    printf '%s\t%s\t%s\n' "$pack_id" "$pack_version" "$pack_name"
+    [ -z "$pack_description" ] || printf '  %s\n' "$pack_description"
+  done
+}
+
+cmd_list_mcps() {
+  [ -f "$MCP_REGISTRY" ] || die "MCP registry missing: $MCP_REGISTRY"
+  local id name kind endpoint command args_csv auth_scheme header_name auth_env setup_url docs pack_id
+  while IFS='|' read -r id name kind endpoint command args_csv auth_scheme header_name auth_env setup_url docs; do
+    case "$id" in ''|'#'*) continue ;; esac
+    printf '%s\t%s\n' "$id" "$name"
+    printf '  kind: %s\n' "$kind"
+    [ "$endpoint" = "-" ] || printf '  url: %s\n' "$endpoint"
+    [ "$command" = "-" ] || printf '  command: %s %s\n' "$command" "${args_csv//,/ }"
+    [ "$auth_scheme" = "none" ] || printf '  auth: %s\n' "$auth_scheme"
+    [ "$auth_env" = "-" ] || printf '  auth env: %s\n' "$auth_env"
+    pack_id="$(mcp_pack_id "$id")"
+    [ -d "$MCP_SKILLS_DIR/$pack_id" ] || :
+    [ ! -d "$MCP_SKILLS_DIR/$pack_id" ] || printf '  skill: %s\n' "$pack_id"
+    [ "$setup_url" = "-" ] || printf '  setup: %s\n' "$setup_url"
+    [ "$docs" = "-" ] || printf '  docs: %s\n' "$docs"
+  done < "$MCP_REGISTRY"
+}
+
+drop_state_record() {
+  local pack_id="$1" tool="$2" scope="$3" project_key="$4" target="$5"
+  local tmp row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed
+  ensure_state
+  tmp="$(mktemp "$STATE_HOME/installed.XXXXXX")"
+  while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
+    [ -n "${row_pack:-}" ] || continue
+    if [ "$row_pack" = "$pack_id" ] && [ "$row_tool" = "$tool" ] && [ "$row_scope" = "$scope" ] && [ "$row_project" = "$project_key" ] && [ "$row_target" = "$target" ]; then
+      continue
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$row_pack" "$row_tool" "$row_scope" "$row_project" "$row_target" "$row_checksum" "$row_backup" "$row_installed" >> "$tmp"
+  done < "$STATE_FILE"
+  mv "$tmp" "$STATE_FILE"
+}
+
+target_has_other_records() {
+  local pack_id="$1" tool="$2" scope="$3" project_key="$4" target="$5"
+  local row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed
+  [ -f "$STATE_FILE" ] || return 1
+  while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
+    [ -n "${row_pack:-}" ] || continue
+    if [ "$row_target" = "$target" ] && { [ "$row_pack" != "$pack_id" ] || [ "$row_tool" != "$tool" ] || [ "$row_scope" != "$scope" ] || [ "$row_project" != "$project_key" ]; }; then
+      return 0
+    fi
+  done < "$STATE_FILE"
+  return 1
+}
+
+parse_common_options() {
+  SCOPE="project"
+  PROJECT_DIR="$(pwd -P)"
+  TOOLS="claude,opencode,codex"
+  FORCE=0
+  YES=0
+  API_KEY_ENV=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tools)
+        [ "$#" -ge 2 ] || die "--tools requires a value"
+        TOOLS="$2"
+        shift 2
+        ;;
+      --scope)
+        [ "$#" -ge 2 ] || die "--scope requires project or global"
+        SCOPE="$2"
+        shift 2
+        ;;
+      --project-dir)
+        [ "$#" -ge 2 ] || die "--project-dir requires a path"
+        PROJECT_DIR="$2"
+        shift 2
+        ;;
+      --force)
+        FORCE=1
+        shift
+        ;;
+      --yes|-y)
+        YES=1
+        shift
+        ;;
+      --api-key-env)
+        [ "$#" -ge 2 ] || die "--api-key-env requires a value"
+        API_KEY_ENV="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+  case "$SCOPE" in project|global) ;; *) die "scope must be project or global" ;; esac
+}
+
+split_tools() {
+  IFS=',' read -r -a TOOL_LIST <<< "$TOOLS"
+  local tool
+  for tool in "${TOOL_LIST[@]}"; do
+    case "$tool" in
+      claude|opencode|codex) ;;
+      '') die "empty tool in --tools" ;;
+      *) die "unsupported tool: $tool" ;;
+    esac
+  done
+}
+
+tool_selected() {
+  local needle="$1" tool
+  for tool in "${TOOL_LIST[@]}"; do
+    [ "$tool" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+tool_base() {
+  local tool="$1" scope="$2"
+  case "$tool:$scope" in
+    claude:project) printf '%s/.claude' "$PROJECT_DIR" ;;
+    claude:global) printf '%s/.claude' "$HOME" ;;
+    opencode:project) printf '%s/.opencode' "$PROJECT_DIR" ;;
+    opencode:global) printf '%s/opencode' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+    codex:project) printf '%s/.codex' "$PROJECT_DIR" ;;
+    codex:global) printf '%s/.codex' "$HOME" ;;
+    *) die "unsupported target: $tool $scope" ;;
+  esac
+}
+
+codex_skill_base() {
+  local scope="$1"
+  case "$scope" in
+    project) printf '%s/.agents/skills' "$PROJECT_DIR" ;;
+    global) printf '%s/.agents/skills' "$HOME" ;;
+    *) die "unsupported codex skill scope: $scope" ;;
+  esac
+}
+
+mcp_pack_id() {
+  printf 'mcp-%s' "$1"
+}
+
+mcp_skill_source_dir() {
+  printf '%s/%s' "$MCP_SKILLS_DIR" "$(mcp_pack_id "$1")"
+}
+
+skill_root_for_tool() {
+  local tool="$1" scope="$2"
+  case "$tool" in
+    claude|opencode) printf '%s/skills' "$(tool_base "$tool" "$scope")" ;;
+    codex) codex_skill_base "$scope" ;;
+    *) die "unsupported skill target: $tool $scope" ;;
+  esac
+}
+
+emit_mcp_skill_files() {
+  local tool="$1" scope="$2" src_root dst_root pack_id
+  pack_id="$(mcp_pack_id "$MCP_ID")"
+  src_root="$(mcp_skill_source_dir "$MCP_ID")"
+  [ -d "$src_root" ] || return 0
+  dst_root="$(skill_root_for_tool "$tool" "$scope")"
+  emit_tree "$src_root" "$dst_root/$pack_id"
+}
+
+emit_tree() {
+  local src_root="$1" dst_root="$2" entry
+  [ -d "$src_root" ] || return 0
+  for entry in "$src_root"/*; do
+    [ -e "$entry" ] || continue
+    if [ -d "$entry" ]; then
+      emit_tree "$entry" "$dst_root/${entry##*/}"
+    elif [ -f "$entry" ]; then
+      printf '%s|%s/%s\n' "$entry" "$dst_root" "${entry##*/}"
+    fi
+  done
+}
+
+emit_file_if_present() {
+  local src="$1" dst="$2"
+  [ -f "$src" ] || return 0
+  printf '%s|%s\n' "$src" "$dst"
+}
+
+collect_pack_files() {
+  local pack_id="$1" tool="$2" scope="$3"
+  local pack_dir="$PACKS_DIR/$pack_id" base skill_base
+  [ -d "$pack_dir" ] || die "unknown pack: $pack_id"
+
+  case "$tool" in
+    claude)
+      base="$(tool_base claude "$scope")"
+      emit_tree "$pack_dir/claude/agents" "$base/agents"
+      emit_tree "$pack_dir/claude/commands" "$base/commands"
+      emit_tree "$pack_dir/skills" "$base/skills"
+      emit_file_if_present "$pack_dir/claude/CLAUDE.md" "$base/CLAUDE.md"
+      ;;
+    opencode)
+      base="$(tool_base opencode "$scope")"
+      emit_tree "$pack_dir/opencode/agents" "$base/agents"
+      emit_tree "$pack_dir/opencode/commands" "$base/commands"
+      emit_tree "$pack_dir/skills" "$base/skills"
+      if [ "$scope" = "project" ]; then
+        emit_file_if_present "$pack_dir/shared/AGENTS.md" "$PROJECT_DIR/AGENTS.md"
+      else
+        emit_file_if_present "$pack_dir/shared/AGENTS.md" "$base/AGENTS.md"
+      fi
+      ;;
+    codex)
+      base="$(tool_base codex "$scope")"
+      skill_base="$(codex_skill_base "$scope")"
+      emit_tree "$pack_dir/codex/agents" "$base/agents"
+      emit_tree "$pack_dir/codex-rules" "$base/rules"
+      emit_tree "$pack_dir/skills" "$skill_base"
+      ;;
+  esac
+}
+
+plan_action() {
+  local pack_id="$1" src="$2" dst="$3"
+  if [ -e "$dst" ]; then
+    if cmp -s "$src" "$dst"; then
+      printf 'same    %s\n' "$dst"
+    elif has_marker "$dst" "$pack_id"; then
+      printf 'update  %s\n' "$dst"
+    elif [ "$FORCE" -eq 1 ]; then
+      printf 'force   %s\n' "$dst"
+    else
+      printf 'skip    %s  (exists; use --force to overwrite)\n' "$dst"
+    fi
+  else
+    printf 'create  %s\n' "$dst"
+  fi
+}
+
+install_file() {
+  local pack_id="$1" tool="$2" scope="$3" src="$4" dst="$5" project_key="$6"
+  local parent backup_dir backup_path checksum now
+  parent="${dst%/*}"
+  now="$(date +%Y%m%d-%H%M%S)"
+  backup_dir="$STATE_HOME/backups/$now"
+
+  if [ -e "$dst" ]; then
+    if cmp -s "$src" "$dst"; then
+      printf 'same    %s\n' "$dst"
+      return 0
+    fi
+    if ! has_marker "$dst" "$pack_id" && [ "$FORCE" -ne 1 ] && [ "${ALLOW_TRACKED_OVERWRITE:-0}" -ne 1 ]; then
+      printf 'skip    %s  (exists; use --force to overwrite)\n' "$dst"
+      return 0
+    fi
+    mkdir -p "$backup_dir"
+    backup_path="$backup_dir/${dst//\//_}"
+    cp "$dst" "$backup_path"
+  else
+    backup_path=""
+  fi
+
+  mkdir -p "$parent"
+  cp "$src" "$dst"
+  checksum="$(checksum_file "$dst")"
+  drop_state_record "$pack_id" "$tool" "$scope" "$project_key" "$dst"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$pack_id" "$tool" "$scope" "$project_key" "$dst" "$checksum" "$backup_path" "$now" >> "$STATE_FILE"
+  printf 'write   %s\n' "$dst"
+}
+
+cmd_diff_or_install() {
+  local mode="$1" pack_id="core-vibe-coder"
+  shift
+  if [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; then
+    pack_id="$1"
+    shift
+  fi
+  parse_common_options "$@"
+  split_tools
+
+  local project_key tool src dst
+  project_key="$PROJECT_DIR"
+  [ "$SCOPE" = "project" ] || project_key="-"
+  if [ "$mode" != "diff" ]; then
+    acquire_lock
+    ensure_state
+  fi
+
+  for tool in "${TOOL_LIST[@]}"; do
+    printf '%s (%s scope)\n' "$tool" "$SCOPE"
+    collect_pack_files "$pack_id" "$tool" "$SCOPE" | while IFS='|' read -r src dst; do
+      [ -n "$src" ] || continue
+      if [ "$mode" = "diff" ]; then
+        plan_action "$pack_id" "$src" "$dst"
+      else
+        install_file "$pack_id" "$tool" "$SCOPE" "$src" "$dst" "$project_key"
+      fi
+    done
+  done
+}
+
+cmd_uninstall() {
+  local pack_id="core-vibe-coder"
+  if [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; then
+    pack_id="$1"
+    shift
+  fi
+  parse_common_options "$@"
+  split_tools
+  acquire_lock
+  ensure_state
+
+  local project_key tmp row_pack row_tool row_scope row_project target checksum backup installed_at current keep
+  project_key="$PROJECT_DIR"
+  [ "$SCOPE" = "project" ] || project_key="-"
+  tmp="$(mktemp "$STATE_HOME/installed.XXXXXX")"
+
+  while IFS='|' read -r row_pack row_tool row_scope row_project target checksum backup installed_at; do
+    [ -n "${row_pack:-}" ] || continue
+    keep=1
+    if [ "$row_pack" = "$pack_id" ] && [ "$row_scope" = "$SCOPE" ] && [ "$row_project" = "$project_key" ] && tool_selected "$row_tool"; then
+      keep=0
+      if [ -f "$target" ]; then
+        current="$(checksum_file "$target")"
+        if [ "$current" = "$checksum" ]; then
+          if target_has_other_records "$row_pack" "$row_tool" "$row_scope" "$row_project" "$target"; then
+            printf 'keep    %s  (used by another vibekit install)\n' "$target"
+          else
+            rm "$target"
+            printf 'remove  %s\n' "$target"
+          fi
+        else
+          printf 'skip    %s  (changed since install)\n' "$target"
+          keep=1
+        fi
+      else
+        printf 'gone    %s\n' "$target"
+      fi
+    fi
+    if [ "$keep" -eq 1 ]; then
+      printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$row_pack" "$row_tool" "$row_scope" "$row_project" "$target" "$checksum" "$backup" "$installed_at" >> "$tmp"
+    fi
+  done < "$STATE_FILE"
+
+  mv "$tmp" "$STATE_FILE"
+}
+
+secret_set() {
+  local name="$1" value="$2" tmp line locked_here=0
+  case "$name" in
+    ''|*[!A-Za-z0-9_]*) die "secret name must contain only A-Z, a-z, 0-9, and _" ;;
+  esac
+  case "$value" in
+    *"'"*) die "secret values containing single quotes are not supported yet" ;;
+    *$'\n'*) die "secret values containing newlines are not supported" ;;
+  esac
+  if [ "${LOCK_HELD:-0}" -ne 1 ]; then
+    acquire_lock
+    locked_here=1
+  fi
+  ensure_state
+  tmp="$(mktemp "$STATE_HOME/secrets.XXXXXX")"
+  if [ -f "$SECRETS_FILE" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "export $name="*) ;;
+        *) printf '%s\n' "$line" >> "$tmp" ;;
+      esac
+    done < "$SECRETS_FILE"
+  fi
+  printf "export %s='%s'\n" "$name" "$value" >> "$tmp"
+  mv "$tmp" "$SECRETS_FILE"
+  chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+  printf 'stored  %s in %s\n' "$name" "$SECRETS_FILE"
+  printf 'load it before starting assistants: . "%s"\n' "$SECRETS_FILE"
+  [ "$locked_here" -eq 0 ] || release_lock
+}
+
+cmd_secrets() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    set)
+      [ "$#" -ge 1 ] || die "usage: vibekit secrets set <NAME> [--value VALUE]"
+      local name="$1" value=""
+      shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --value)
+            [ "$#" -ge 2 ] || die "--value requires a value"
+            value="$2"
+            shift 2
+            ;;
+          *) die "unknown option: $1" ;;
+        esac
+      done
+      if [ -z "$value" ]; then
+        printf 'Enter value for %s: ' "$name" >&2
+        IFS= read -r value
+      fi
+      secret_set "$name" "$value"
+      ;;
+    *) die "usage: vibekit secrets set <NAME> [--value VALUE]" ;;
+  esac
+}
+
+mcp_lookup() {
+  local needle="$1" id name kind endpoint command args_csv auth_scheme header_name auth_env setup_url docs
+  [ -f "$MCP_REGISTRY" ] || die "MCP registry missing: $MCP_REGISTRY"
+  while IFS='|' read -r id name kind endpoint command args_csv auth_scheme header_name auth_env setup_url docs; do
+    case "$id" in ''|'#'*) continue ;; esac
+    if [ "$id" = "$needle" ]; then
+      MCP_ID="$id"
+      MCP_NAME="$name"
+      MCP_KIND="$kind"
+      MCP_ENDPOINT="$endpoint"
+      MCP_COMMAND="$command"
+      MCP_ARGS_CSV="$args_csv"
+      MCP_AUTH_SCHEME="$auth_scheme"
+      MCP_HEADER_NAME="$header_name"
+      MCP_AUTH_ENV="$auth_env"
+      MCP_SETUP_URL="$setup_url"
+      MCP_DOCS="$docs"
+      return 0
+    fi
+  done < "$MCP_REGISTRY"
+  return 1
+}
+
+maybe_open_url() {
+  local url="$1"
+  if command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 || true
+  else
+    printf 'open manually: %s\n' "$url"
+  fi
+}
+
+prompt_for_optional_key() {
+  local env_name="$1" setup_url="$2" value="" answer=""
+  normalize_empty "$env_name" && return 0
+  if [ -n "${!env_name:-}" ]; then
+    printf 'secret  %s already set in environment\n' "$env_name"
+    return 0
+  fi
+  if [ "$YES" -eq 1 ]; then
+    printf 'secret  %s not set; generated configs will reference it if you set it later\n' "$env_name"
+    return 0
+  fi
+  [ -t 0 ] || return 0
+  if ! normalize_empty "$setup_url"; then
+    printf '%s credential is optional but recommended. Open setup page? [y/N] ' "$env_name" >&2
+    IFS= read -r answer || true
+    case "$answer" in y|Y|yes|YES) maybe_open_url "$setup_url" ;; esac
+  fi
+  printf 'Paste %s value, or press Enter to skip: ' "$env_name" >&2
+  IFS= read -r value || true
+  [ -n "$value" ] || return 0
+  secret_set "$env_name" "$value"
+}
+
+normalize_empty() {
+  case "$1" in ''|'-') return 0 ;; *) return 1 ;; esac
+}
+
+json_string() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+csv_to_json_array() {
+  local csv="$1" arg first=1
+  local -a values=()
+  printf '['
+  if ! normalize_empty "$csv"; then
+    IFS=',' read -r -a values <<< "$csv"
+    for arg in "${values[@]}"; do
+      [ "$first" -eq 1 ] || printf ', '
+      json_string "$arg"
+      first=0
+    done
+  fi
+  printf ']'
+}
+
+command_to_json_array() {
+  local command="$1" args_csv="$2" arg first=1
+  local -a values=()
+  printf '['
+  if ! normalize_empty "$command"; then
+    json_string "$command"
+    first=0
+  fi
+  if ! normalize_empty "$args_csv"; then
+    IFS=',' read -r -a values <<< "$args_csv"
+    for arg in "${values[@]}"; do
+      [ "$first" -eq 1 ] || printf ', '
+      json_string "$arg"
+      first=0
+    done
+  fi
+  printf ']'
+}
+
+mcp_target_path() {
+  local tool="$1" scope="$2"
+  case "$tool:$scope" in
+    claude:project) printf '%s/.mcp.json' "$PROJECT_DIR" ;;
+    claude:global) return 1 ;;
+    opencode:project) printf '%s/opencode.json' "$PROJECT_DIR" ;;
+    opencode:global) printf '%s/opencode/opencode.json' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+    codex:project) printf '%s/.codex/config.toml' "$PROJECT_DIR" ;;
+    codex:global) printf '%s/.codex/config.toml' "$HOME" ;;
+    *) return 1 ;;
+  esac
+}
+
+write_mcp_config() {
+  local tool="$1" env_name="$2"
+  local server="$MCP_ID" kind="$MCP_KIND" endpoint="$MCP_ENDPOINT" command="$MCP_COMMAND" args_csv="$MCP_ARGS_CSV" auth_scheme="$MCP_AUTH_SCHEME" header_name="$MCP_HEADER_NAME"
+  if [ "$auth_scheme" = "bearer-token" ] && normalize_empty "$header_name"; then
+    header_name="Authorization"
+  fi
+  case "$tool" in
+    claude)
+      if [ "$kind" = "remote" ]; then
+        if [ "$auth_scheme" = "header-env" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
+          cat <<EOF
+{
+  "mcpServers": {
+    "$server": {
+      "type": "http",
+      "url": "$endpoint",
+      "headers": {
+        "$header_name": "\${$env_name}"
+      }
+    }
+  }
+}
+EOF
+        elif [ "$auth_scheme" = "bearer-token" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
+          cat <<EOF
+{
+  "mcpServers": {
+    "$server": {
+      "type": "http",
+      "url": "$endpoint",
+      "headers": {
+        "$header_name": "Bearer \${$env_name}"
+      }
+    }
+  }
+}
+EOF
+        else
+          cat <<EOF
+{
+  "mcpServers": {
+    "$server": {
+      "type": "http",
+      "url": "$endpoint"
+    }
+  }
+}
+EOF
+        fi
+      else
+        cat <<EOF
+{
+  "mcpServers": {
+    "$server": {
+      "type": "stdio",
+      "command": "$command",
+      "args": $(csv_to_json_array "$args_csv")
+    }
+  }
+}
+EOF
+      fi
+      ;;
+    opencode)
+      if [ "$kind" = "remote" ]; then
+        if [ "$auth_scheme" = "header-env" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
+          cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "$server": {
+      "type": "remote",
+      "url": "$endpoint",
+      "oauth": false,
+      "headers": {
+        "$header_name": "{env:$env_name}"
+      }
+    }
+  }
+}
+EOF
+        elif [ "$auth_scheme" = "bearer-token" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
+          cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "$server": {
+      "type": "remote",
+      "url": "$endpoint",
+      "oauth": false,
+      "headers": {
+        "$header_name": "Bearer {env:$env_name}"
+      }
+    }
+  }
+}
+EOF
+        elif [ "$auth_scheme" = "oauth" ]; then
+          cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "$server": {
+      "type": "remote",
+      "url": "$endpoint",
+      "oauth": {}
+    }
+  }
+}
+EOF
+        else
+          cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "$server": {
+      "type": "remote",
+      "url": "$endpoint"
+    }
+  }
+}
+EOF
+        fi
+      else
+        cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "$server": {
+      "type": "local",
+      "command": $(command_to_json_array "$command" "$args_csv"),
+      "enabled": true
+    }
+  }
+}
+EOF
+      fi
+      ;;
+    codex)
+      if [ "$kind" = "remote" ]; then
+        if [ "$auth_scheme" = "header-env" ] && ! normalize_empty "$env_name" && ! normalize_empty "$header_name"; then
+          cat <<EOF
+[mcp_servers.$server]
+url = "$endpoint"
+
+[mcp_servers.$server.env_http_headers]
+$header_name = "$env_name"
+EOF
+        elif [ "$auth_scheme" = "bearer-token" ] && ! normalize_empty "$env_name"; then
+          cat <<EOF
+[mcp_servers.$server]
+url = "$endpoint"
+bearer_token_env_var = "$env_name"
+EOF
+        else
+          cat <<EOF
+[mcp_servers.$server]
+url = "$endpoint"
+EOF
+        fi
+      else
+        cat <<EOF
+[mcp_servers.$server]
+command = "$command"
+args = $(csv_to_json_array "$args_csv")
+EOF
+      fi
+      ;;
+  esac
+}
+
+manual_mcp_hint() {
+  local tool="$1" env_name="$2" auth_scheme="$MCP_AUTH_SCHEME" header_name="$MCP_HEADER_NAME"
+  if [ "$auth_scheme" = "bearer-token" ] && normalize_empty "$header_name"; then
+    header_name="Authorization"
+  fi
+  printf 'manual  %s config already exists or unsupported scope. Add %s manually:\n' "$tool" "$MCP_NAME"
+  case "$tool" in
+    claude)
+      if [ "$MCP_KIND" = "remote" ]; then
+        printf '  claude mcp add --transport http %s %s\n' "$MCP_ID" "$MCP_ENDPOINT"
+        case "$auth_scheme" in
+          bearer-token) normalize_empty "$env_name" || printf '  with %s header using Bearer token from %s\n' "$header_name" "$env_name" ;;
+          header-env) normalize_empty "$env_name" || printf '  with header %s from %s\n' "$header_name" "$env_name" ;;
+          oauth) printf '  then authenticate the server inside Claude\n' ;;
+        esac
+      else
+        printf '  claude mcp add --transport stdio %s -- %s %s\n' "$MCP_ID" "$MCP_COMMAND" "${MCP_ARGS_CSV//,/ }"
+      fi
+      ;;
+    opencode)
+      printf '  add mcp.%s to opencode.json\n' "$MCP_ID"
+      case "$auth_scheme" in
+        bearer-token) normalize_empty "$env_name" || printf '  set header %s to Bearer {env:%s}\n' "$header_name" "$env_name" ;;
+        header-env) normalize_empty "$env_name" || printf '  set header %s from {env:%s}\n' "$header_name" "$env_name" ;;
+        oauth) printf '  then run: opencode mcp auth %s\n' "$MCP_ID" ;;
+      esac
+      ;;
+    codex)
+      printf '  add [mcp_servers.%s] to config.toml\n' "$MCP_ID"
+      case "$auth_scheme" in
+        bearer-token) normalize_empty "$env_name" || printf '  set bearer_token_env_var = "%s"\n' "$env_name" ;;
+        header-env) normalize_empty "$env_name" || printf '  set env_http_headers.%s = "%s"\n' "$header_name" "$env_name" ;;
+        oauth) printf '  then run: codex mcp login %s\n' "$MCP_ID" ;;
+      esac
+      ;;
+  esac
+}
+
+install_generated_file() {
+  local pack_id="$1" tool="$2" scope="$3" dst="$4" project_key="$5" generator_tool="$6" env_name="$7"
+  local tmp parent current tracked_checksum="" row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed
+  tmp="$(mktemp "$STATE_HOME/generated.XXXXXX")"
+  write_mcp_config "$generator_tool" "$env_name" > "$tmp"
+
+  if [ -e "$dst" ]; then
+    while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
+      if [ "$row_pack" = "$pack_id" ] && [ "$row_tool" = "$tool" ] && [ "$row_scope" = "$scope" ] && [ "$row_project" = "$project_key" ] && [ "$row_target" = "$dst" ]; then
+        tracked_checksum="$row_checksum"
+      fi
+    done < "$STATE_FILE"
+    if [ -z "$tracked_checksum" ]; then
+      manual_mcp_hint "$tool" "$env_name"
+      rm -f "$tmp"
+      return 0
+    fi
+    current="$(checksum_file "$dst")"
+    if [ "$current" != "$tracked_checksum" ] && [ "$FORCE" -ne 1 ]; then
+      printf 'skip    %s  (changed since vibekit install; use --force to overwrite)\n' "$dst"
+      rm -f "$tmp"
+      return 0
+    fi
+  fi
+
+  parent="${dst%/*}"
+  mkdir -p "$parent"
+  local old_allow="$ALLOW_TRACKED_OVERWRITE"
+  ALLOW_TRACKED_OVERWRITE=1
+  install_file "$pack_id" "$tool" "$scope" "$tmp" "$dst" "$project_key"
+  ALLOW_TRACKED_OVERWRITE="$old_allow"
+  rm -f "$tmp"
+}
+
+cmd_mcp_install() {
+  local mode="${1:-install}" server="${2:-}"
+  [ -n "$server" ] || die "usage: vibekit mcp $mode <server>"
+  shift 2 || true
+  parse_common_options "$@"
+  split_tools
+
+  MCP_ID=""
+  MCP_NAME=""
+  MCP_KIND=""
+  MCP_ENDPOINT=""
+  MCP_COMMAND=""
+  MCP_ARGS_CSV=""
+  MCP_AUTH_SCHEME=""
+  MCP_HEADER_NAME=""
+  MCP_AUTH_ENV=""
+  MCP_SETUP_URL=""
+  MCP_DOCS=""
+  mcp_lookup "$server" || die "unknown MCP server: $server"
+
+  local env_name="$API_KEY_ENV" project_key tool dst pack_id src skill_dst
+  pack_id="$(mcp_pack_id "$MCP_ID")"
+  normalize_empty "$env_name" && env_name="$MCP_AUTH_ENV"
+  if [ "$mode" = "install" ]; then
+    prompt_for_optional_key "$env_name" "$MCP_SETUP_URL"
+    acquire_lock
+    ensure_state
+  fi
+
+  project_key="$PROJECT_DIR"
+  [ "$SCOPE" = "project" ] || project_key="-"
+
+  for tool in "${TOOL_LIST[@]}"; do
+    if ! dst="$(mcp_target_path "$tool" "$SCOPE")"; then
+      manual_mcp_hint "$tool" "$env_name"
+    else
+      if [ "$mode" = "diff" ]; then
+        local tmp
+        tmp="$(mktemp "/tmp/vibekit-mcp.XXXXXX")"
+        write_mcp_config "$tool" "$env_name" > "$tmp"
+        plan_action "$pack_id" "$tmp" "$dst"
+        rm -f "$tmp"
+      else
+        install_generated_file "$pack_id" "$tool" "$SCOPE" "$dst" "$project_key" "$tool" "$env_name"
+      fi
+    fi
+    emit_mcp_skill_files "$tool" "$SCOPE" | while IFS='|' read -r src skill_dst; do
+      [ -n "$src" ] || continue
+      if [ "$mode" = "diff" ]; then
+        plan_action "$pack_id" "$src" "$skill_dst"
+      else
+        install_file "$pack_id" "$tool" "$SCOPE" "$src" "$skill_dst" "$project_key"
+      fi
+    done
+  done
+}
+
+cmd_mcp_uninstall() {
+  local server="${1:-}"
+  [ -n "$server" ] || die "usage: vibekit mcp uninstall <server>"
+  shift || true
+  mcp_lookup "$server" || die "unknown MCP server: $server"
+  cmd_uninstall "mcp-$server" "$@"
+}
+
+cmd_mcp() {
+  local sub="${1:-list}"
+  shift || true
+  case "$sub" in
+    list) cmd_list_mcps ;;
+    diff) cmd_mcp_install diff "$@" ;;
+    install) cmd_mcp_install install "$@" ;;
+    uninstall) cmd_mcp_uninstall "$@" ;;
+    *) die "usage: vibekit mcp [list|diff <server>|install <server>|uninstall <server>]" ;;
+  esac
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    --version|version) printf '%s\n' "$VK_VERSION" ;;
+    detect) cmd_detect "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    self) cmd_self "$@" ;;
+    status) cmd_status "$@" ;;
+    list)
+      case "${1:-packs}" in
+        packs) cmd_list_packs ;;
+        mcps|mcp) cmd_list_mcps ;;
+        *) die "usage: vibekit list [packs|mcps]" ;;
+      esac
+      ;;
+    diff) cmd_diff_or_install diff "$@" ;;
+    install) cmd_diff_or_install install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    mcp) cmd_mcp "$@" ;;
+    secrets) cmd_secrets "$@" ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

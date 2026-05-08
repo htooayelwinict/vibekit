@@ -1,0 +1,8 @@
+.opencode/
+.claude/
+.codex/
+.agents/
+.playwright-mcp/
+.mcp.json
+opencode.json
+AGENTS.md

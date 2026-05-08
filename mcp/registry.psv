@@ -1,0 +1,6 @@
+# id|name|kind|endpoint|command|args_csv|auth_scheme|header_name|auth_env|setup_url|docs
+context7|Context7|remote|https://mcp.context7.com/mcp|-|-|header-env|CONTEXT7_API_KEY|CONTEXT7_API_KEY|https://context7.com/dashboard|https://github.com/upstash/context7
+playwright|Playwright|local|-|npx|-y,@playwright/mcp@latest|none|-|-|-|https://github.com/microsoft/playwright-mcp
+sentry|Sentry|remote|https://mcp.sentry.dev/mcp|-|-|oauth|-|-|https://mcp.sentry.dev|https://docs.sentry.io/ai/mcp/
+figma|Figma|remote|https://mcp.figma.com/mcp|-|-|oauth|-|-|https://www.figma.com/mcp-catalog/|https://developers.figma.com/docs/figma-mcp-server/remote-server-installation/
+github|GitHub|remote|https://api.githubcopilot.com/mcp/|-|-|bearer-token|Authorization|GITHUB_PAT_TOKEN|https://github.com/settings/personal-access-tokens/new|https://github.com/github/github-mcp-server
