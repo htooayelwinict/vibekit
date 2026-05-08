@@ -1,6 +1,25 @@
+<p align="center">
+  <img src="assets/vibekit-banner.svg" alt="Animated Vibekit banner" width="100%" />
+</p>
+
 # Vibekit
 
-CLI-first setup manager for vibe coders.
+<p align="center"><strong>CLI-first setup manager for vibe coders.</strong></p>
+
+<p align="center">Local-first pack, MCP, and self-install workflow for Claude Code, OpenCode, and Codex.</p>
+
+<p align="center">
+  <img alt="Status early MVP" src="https://img.shields.io/badge/status-early_mvp-7c3aed?style=for-the-badge" />
+  <img alt="Runtime Bash" src="https://img.shields.io/badge/runtime-bash-111827?style=for-the-badge&logo=gnubash&logoColor=white" />
+  <img alt="Platform macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-0f172a?style=for-the-badge" />
+  <img alt="License personal use only" src="https://img.shields.io/badge/license-personal_use_only-dc2626?style=for-the-badge" />
+</p>
+
+> [!IMPORTANT]
+> Vibekit is source-available for personal use only.
+> Commercial use is not allowed.
+> Use on company-owned or company-managed devices is not allowed.
+> See `LICENSE` for the full terms.
 
 Vibekit installs and tracks coding-assistant setup packs for Claude Code, OpenCode, and Codex. The MVP is local-first, Bash-based, and safe by default.
 
@@ -197,3 +216,23 @@ claude mcp add --transport http figma https://mcp.figma.com/mcp
 ## Reference Corpus
 
 The sibling `claude-config` directory is a reference corpus only. It should not be copied wholesale into arbitrary projects because it is Claude-specific, stack-biased, and includes permissive local settings.
+
+## License
+
+Copyright (c) 2026 `htooayelwinict`.
+
+Vibekit is released under the `Vibekit Personal Use Only License 1.0`.
+
+You may:
+
+- use, copy, and modify Vibekit for your own personal, non-commercial use
+- run it on devices you personally own or personally control for private use
+- share original or modified copies only if the same personal-use-only terms and copyright notice stay with the code
+
+You may not:
+
+- use Vibekit for commercial work, internal business work, client work, or paid services
+- use Vibekit on company-owned, employer-managed, or other organization-managed devices
+- sell, sublicense, host, or redistribute Vibekit under different terms
+
+See `LICENSE` for the full text.
