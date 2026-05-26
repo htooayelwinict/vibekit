@@ -34,7 +34,7 @@ Implemented:
 - Dry-run diffs
 - Safe install with backups and state tracking
 - Safe uninstall by checksum
-- Core Vibe Coder pack
+- Core Vibe Coder pack with persistent planning, implementation, research, review, and specialist workflows
 - Claude Code adapter
 - OpenCode adapter
 - Codex adapter
@@ -125,6 +125,7 @@ vibekit mcp install context7
 vibekit mcp uninstall context7
 vibekit mcp install playwright
 vibekit secrets set CONTEXT7_API_KEY
+vibekit secrets unset CONTEXT7_API_KEY
 ```
 
 ## Safety Model
@@ -150,8 +151,10 @@ OpenCode:
 
 Codex:
 
-- Project: `.codex/agents`, `.codex/rules`, `.agents/skills`
-- Global: `~/.codex/agents`, `~/.codex/rules`, `~/.agents/skills`
+- Project: project `AGENTS.md` plus a local Codex plugin marketplace under `${XDG_DATA_HOME:-~/.local/share}/vibekit/codex-marketplaces/vibekit/`
+- Global: the same local Codex plugin marketplace without a project `AGENTS.md`
+
+Vibekit installs Codex packs as a real Codex plugin, then runs `codex plugin add core-vibe-coder@vibekit` so Codex caches and enables the plugin. The plugin contains Codex commands, specialist agents, and skills. Codex currently reads MCP config from `~/.codex/config.toml`, not project `.codex/config.toml`, so Vibekit installs Codex MCP entries into `~/.codex/config.toml` even when `--scope project` is selected.
 
 ## MCP
 
@@ -164,6 +167,7 @@ Current registry entries:
 
 - `context7`: official docs lookup via API key header
 - `playwright`: browser automation via local stdio server
+- `open-bridge`: local OpenRouter-backed reasoning, synthesis, and second-opinion analysis
 - `sentry`: remote OAuth MCP for production issue investigation
 - `figma`: remote OAuth MCP for design context
 - `github`: remote bearer-token MCP for issues, PRs, workflows, and releases
@@ -175,17 +179,32 @@ Current registry entries:
 ./bin/vibekit mcp install sentry --tools claude,opencode,codex --scope project
 ./bin/vibekit mcp install github --tools claude,opencode,codex --scope project
 ./bin/vibekit mcp install playwright --tools claude,opencode,codex --scope project
+./bin/vibekit mcp install open-bridge --tools claude,opencode,codex --scope project
 ./bin/vibekit mcp install figma --tools claude,opencode,codex --scope project
 ./bin/vibekit mcp uninstall context7 --tools claude,opencode,codex --scope project
+./bin/vibekit mcp uninstall open-bridge --tools codex --scope project --purge-secrets
 ```
 
 Installed MCP skills are placed alongside each assistant's normal skills:
 
 - Claude: `.claude/skills/mcp-<name>/SKILL.md`
 - OpenCode: `.opencode/skills/mcp-<name>/SKILL.md`
-- Codex: `.agents/skills/mcp-<name>/SKILL.md`
+- Codex: `~/.codex/skills/mcp-<name>/SKILL.md`
 
-The built-in planning, debugging, and review setup is instructed to load these skills when a task needs external docs, GitHub state, browser checks, design context, or production incident data.
+The built-in planning, research, brainstorming, implementation, debugging, and review setup is instructed to load these skills when a task needs external docs, GitHub state, browser checks, design context, production incident data, or a second-opinion reasoning pass.
+
+`open-bridge` requires `OPENROUTER_API_KEY` plus a local bridge runtime. During install, Vibekit also offers an `OPENROUTER_MODEL` selection and stores it in the same secrets file. The upstream project supports `pip install openrouter-mcp-bridge` and `uvx openrouter-mcp-bridge`. Vibekit now bootstraps a managed runtime under `${XDG_DATA_HOME:-~/.local/share}/vibekit/mcp-runtimes/open-bridge/`, then points the generated MCP config at a Vibekit-managed launcher that loads Vibekit's secrets file before starting the server.
+
+Runtime bootstrap rules:
+
+- Prefer `python3.12`, `python3.11`, or `python3.10` and install `openrouter-mcp-bridge` into a managed virtualenv.
+- If a compatible Python is not available, use `uv` to install the tool with `uv tool install --python 3.10 openrouter-mcp-bridge`.
+- If `uv` is missing, install a managed copy of `uv` with Astral's official installer into Vibekit's runtime directory.
+- On macOS package managers, install `uv` rather than a separate `uvx` formula. `uvx` is an alias provided by `uv`.
+
+Because the managed launcher loads `${XDG_STATE_HOME:-~/.local/state}/vibekit/secrets.env`, Claude, OpenCode, and Codex can all receive `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` without relying on the shell that launched the assistant.
+
+On MCP uninstall, Vibekit asks whether to keep stored MCP secrets for future reinstall or remove them completely. Use `--purge-secrets` for non-interactive cleanup, or `vibekit secrets unset <NAME>` to remove a single stored value.
 
 Claude global MCP configuration is intentionally not written directly in MVP because Claude stores user/global MCP state in `~/.claude.json`. Use Claude's own command for global Claude MCP setup:
 
@@ -197,6 +216,12 @@ For Claude global Playwright MCP setup, use Claude's command:
 
 ```bash
 claude mcp add --transport stdio playwright -- npx -y @playwright/mcp@latest
+```
+
+For Claude global Open Bridge MCP setup, export `OPENROUTER_API_KEY` first and then use Claude's command:
+
+```bash
+claude mcp add --transport stdio open-bridge --env OPENROUTER_API_KEY="$OPENROUTER_API_KEY" -- uvx openrouter-mcp-bridge
 ```
 
 For Claude global GitHub MCP setup, use Claude's command with a PAT header:

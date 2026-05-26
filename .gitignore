@@ -7,3 +7,7 @@
 .mcp.json
 opencode.json
 AGENTS.md
+!packs/core-vibe-coder/shared/AGENTS.md
+!packs/core-vibe-coder/codex/.agents/
+!packs/core-vibe-coder/codex/.agents/plugins/
+!packs/core-vibe-coder/codex/.agents/plugins/marketplace.json

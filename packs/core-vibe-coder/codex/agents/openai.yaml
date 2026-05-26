@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vibekit Core Vibe Coder"
+  short_description: "Use Vibekit specialist agents for plan-driven coding work"
+  default_prompt: "Route coding work through Vibekit's planner, implementer, debugger, reviewer, tester, and other specialist agents when that improves quality."

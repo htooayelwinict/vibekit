@@ -1,0 +1,37 @@
+{
+  "name": "core-vibe-coder",
+  "version": "0.1.0",
+  "description": "Vibekit coding workflow pack with durable planning, specialist agents, slash commands, and repo-local operating rules.",
+  "author": {
+    "name": "Vibekit"
+  },
+  "homepage": "https://github.com/htooayelwinict/vibekit",
+  "repository": "https://github.com/htooayelwinict/vibekit",
+  "license": "MIT",
+  "keywords": [
+    "vibekit",
+    "coding",
+    "planning",
+    "agents",
+    "skills"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Vibekit Core Vibe Coder",
+    "shortDescription": "Planning-first coding workflows, specialist agents, and durable project context.",
+    "longDescription": "Installs Vibekit's core coding arsenal for Codex: slash commands, specialist agents, skills, and repo-local AGENTS.md rules for plan-driven implementation.",
+    "developerName": "Vibekit",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/htooayelwinict/vibekit",
+    "defaultPrompt": [
+      "Plan, implement, debug, review, test, research, document, secure, and deploy code using Vibekit workflows."
+    ],
+    "brandColor": "#0F766E",
+    "screenshots": []
+  }
+}

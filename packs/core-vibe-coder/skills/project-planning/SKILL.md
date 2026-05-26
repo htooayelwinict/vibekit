@@ -1,22 +1,39 @@
 ---
 name: project-planning
-description: Create concise implementation plans with research, phases, risks, and verification.
+description: Create structured implementation plans with repository research, phased execution, risks, and verification.
 ---
 <!-- vibekit:pack=core-vibe-coder -->
 
 # Project Planning
 
-Use this skill when a change needs structure before implementation.
+Use this skill when work is unclear, spans multiple files, carries hidden risk, or benefits from sequencing before implementation.
 
-## Process
+## Workflow
 
 1. Restate the goal in one sentence.
-2. Search the codebase for existing patterns.
-3. If the task needs external docs, GitHub state, browser checks, design context, or production incident data, load the matching `mcp-*` skill first.
-4. Identify concrete files likely to change.
-5. Break work into small phases.
-6. List risks and rollback considerations.
-7. Define verification commands.
+2. Search the codebase for existing patterns, related tests, and constraints.
+3. If the task needs external docs, GitHub state, browser checks, design context, production incident data, or a second-opinion reasoning pass and the user already enabled the MCP, load the matching `mcp-*` skill first.
+4. Identify concrete files, dependencies, and likely order of operations.
+5. Break the work into small phases that can be verified independently.
+6. List risks, rollback considerations, assumptions, and unknowns.
+7. Define exact verification commands based on the repository.
+8. Always write durable plan artifacts inside the repository so later implementation can reload context without relying on chat history.
+
+## Planning Checklist
+
+- Goal and acceptance criteria
+- Existing patterns to follow
+- Files likely to change
+- Dependencies and sequencing
+- Risks and rollback notes
+- Verification commands
+
+## Phase Heuristics
+
+- Put data shape, schema, or contract changes before consumers.
+- Put shared types, helpers, or interfaces before dependent files.
+- Prefer phases that can be reviewed and verified independently.
+- Call out anything that should ship behind a flag or be rollout-safe.
 
 ## Relevant MCP Skills
 
@@ -25,14 +42,45 @@ Use this skill when a change needs structure before implementation.
 - `mcp-figma` for design-driven implementation planning
 - `mcp-sentry` for production issue or release context
 - `mcp-playwright` for browser-flow or UI verification planning
+- `mcp-open-bridge` for architecture comparison, plan stress-testing, and second-pass reasoning
+
+## Required Plan Artifacts
+
+Create a folder using this structure:
+
+```text
+plan/
+└── <topic>-<YYYYMMDD-HHMMSS>/
+    ├── README.md
+    ├── plan.md
+    ├── research/
+    │   ├── requirements.md
+    │   ├── existing-code.md
+    │   └── references.md
+    └── phases/
+        ├── phase-1-<name>.md
+        ├── phase-2-<name>.md
+        └── ...
+```
+
+Rules:
+
+- `plan.md` is the single source of truth for implementation.
+- `README.md` is the quick human summary.
+- `research/` captures inputs, existing patterns, and external references.
+- `phases/` contains execution-ready steps with verification.
 
 ## Output
 
-Return a plan with:
+Return a plan with these sections:
 
 - Goal
+- Acceptance criteria
 - Existing patterns
 - Files to change
 - Phases
-- Risks
+- Risks and unknowns
 - Verification
+- Recommended first implementation step
+
+Use [reference.md](reference.md) for reusable templates, estimation cues, and risk prompts.

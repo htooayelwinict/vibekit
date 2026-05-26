@@ -17,6 +17,7 @@ SCOPE="project"
 FORCE=0
 YES=0
 API_KEY_ENV=""
+PURGE_SECRETS=0
 ALLOW_TRACKED_OVERWRITE=0
 LOCK_HELD=0
 
@@ -45,8 +46,9 @@ Usage:
   vibekit mcp list
   vibekit mcp diff <server> [--tools claude,opencode,codex] [--scope project|global]
   vibekit mcp install <server> [--tools claude,opencode,codex] [--scope project|global]
-  vibekit mcp uninstall <server> [--tools claude,opencode,codex] [--scope project|global]
+  vibekit mcp uninstall <server> [--tools claude,opencode,codex] [--scope project|global] [--purge-secrets]
   vibekit secrets set <NAME> [--value VALUE]
+  vibekit secrets unset <NAME>
 
 Defaults:
   pack:  core-vibe-coder
@@ -254,6 +256,86 @@ fresh_shell_status_command() {
 
 self_runtime_base_dir() {
   printf '%s/vibekit/self' "${XDG_DATA_HOME:-$HOME/.local/share}"
+}
+
+mcp_runtime_base_dir() {
+  printf '%s/vibekit/mcp-runtimes' "${XDG_DATA_HOME:-$HOME/.local/share}"
+}
+
+codex_marketplace_name() {
+  printf 'vibekit'
+}
+
+codex_marketplace_root() {
+  printf '%s/vibekit/codex-marketplaces/%s' "${XDG_DATA_HOME:-$HOME/.local/share}" "$(codex_marketplace_name)"
+}
+
+codex_plugin_root() {
+  local pack_id="$1"
+  printf '%s/plugins/%s' "$(codex_marketplace_root)" "$pack_id"
+}
+
+codex_plugin_selector() {
+  local pack_id="$1"
+  printf '%s@%s' "$pack_id" "$(codex_marketplace_name)"
+}
+
+codex_config_path() {
+  printf '%s/.codex/config.toml' "$HOME"
+}
+
+mcp_runtime_root() {
+  local server="$1"
+  printf '%s/%s' "$(mcp_runtime_base_dir)" "$server"
+}
+
+mcp_runtime_venv_dir() {
+  local server="$1"
+  printf '%s/.venv' "$(mcp_runtime_root "$server")"
+}
+
+mcp_runtime_bin_dir() {
+  local server="$1"
+  printf '%s/bin' "$(mcp_runtime_root "$server")"
+}
+
+mcp_runtime_uv_bin_dir() {
+  local server="$1"
+  printf '%s/uv-bin' "$(mcp_runtime_root "$server")"
+}
+
+mcp_runtime_uv_tool_dir() {
+  local server="$1"
+  printf '%s/uv-tools' "$(mcp_runtime_root "$server")"
+}
+
+mcp_runtime_python_path() {
+  local server="$1"
+  printf '%s/bin/python' "$(mcp_runtime_venv_dir "$server")"
+}
+
+mcp_runtime_bin_path() {
+  local server="$1"
+  case "$server" in
+    open-bridge) printf '%s/openrouter-mcp-bridge' "$(mcp_runtime_bin_dir "$server")" ;;
+    *) return 1 ;;
+  esac
+}
+
+mcp_runtime_launcher_path() {
+  local server="$1"
+  case "$server" in
+    open-bridge) printf '%s/launch/openrouter-mcp-bridge' "$(mcp_runtime_root "$server")" ;;
+    *) return 1 ;;
+  esac
+}
+
+mcp_runtime_venv_bin_path() {
+  local server="$1"
+  case "$server" in
+    open-bridge) printf '%s/bin/openrouter-mcp-bridge' "$(mcp_runtime_venv_dir "$server")" ;;
+    *) return 1 ;;
+  esac
 }
 
 self_target_path() {
@@ -837,6 +919,7 @@ parse_common_options() {
   FORCE=0
   YES=0
   API_KEY_ENV=""
+  PURGE_SECRETS=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --tools)
@@ -856,6 +939,10 @@ parse_common_options() {
         ;;
       --force)
         FORCE=1
+        shift
+        ;;
+      --purge-secrets)
+        PURGE_SECRETS=1
         shift
         ;;
       --yes|-y)
@@ -902,8 +989,8 @@ tool_base() {
     claude:global) printf '%s/.claude' "$HOME" ;;
     opencode:project) printf '%s/.opencode' "$PROJECT_DIR" ;;
     opencode:global) printf '%s/opencode' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
-    codex:project) printf '%s/.codex' "$PROJECT_DIR" ;;
-    codex:global) printf '%s/.codex' "$HOME" ;;
+    codex:project) codex_plugin_root "core-vibe-coder" ;;
+    codex:global) codex_plugin_root "core-vibe-coder" ;;
     *) die "unsupported target: $tool $scope" ;;
   esac
 }
@@ -911,8 +998,8 @@ tool_base() {
 codex_skill_base() {
   local scope="$1"
   case "$scope" in
-    project) printf '%s/.agents/skills' "$PROJECT_DIR" ;;
-    global) printf '%s/.agents/skills' "$HOME" ;;
+    project) printf '%s/.codex/skills' "$HOME" ;;
+    global) printf '%s/.codex/skills' "$HOME" ;;
     *) die "unsupported codex skill scope: $scope" ;;
   esac
 }
@@ -956,6 +1043,17 @@ emit_tree() {
   done
 }
 
+emit_codex_agent_files() {
+  local src_root="$1" dst_root="$2" entry
+  [ -d "$src_root" ] || return 0
+  for entry in "$src_root"/*; do
+    [ -f "$entry" ] || continue
+    case "$entry" in
+      *.md|*.yaml) printf '%s|%s/%s\n' "$entry" "$dst_root" "${entry##*/}" ;;
+    esac
+  done
+}
+
 emit_file_if_present() {
   local src="$1" dst="$2"
   [ -f "$src" ] || return 0
@@ -987,11 +1085,16 @@ collect_pack_files() {
       fi
       ;;
     codex)
-      base="$(tool_base codex "$scope")"
-      skill_base="$(codex_skill_base "$scope")"
-      emit_tree "$pack_dir/codex/agents" "$base/agents"
+      base="$(codex_plugin_root "$pack_id")"
+      emit_file_if_present "$pack_dir/codex/.agents/plugins/marketplace.json" "$(codex_marketplace_root)/.agents/plugins/marketplace.json"
+      emit_file_if_present "$pack_dir/codex/.codex-plugin/plugin.json" "$base/.codex-plugin/plugin.json"
+      emit_codex_agent_files "$pack_dir/codex/agents" "$base/agents"
+      emit_tree "$pack_dir/codex/commands" "$base/commands"
       emit_tree "$pack_dir/codex-rules" "$base/rules"
-      emit_tree "$pack_dir/skills" "$skill_base"
+      emit_tree "$pack_dir/skills" "$base/skills"
+      if [ "$scope" = "project" ]; then
+        emit_file_if_present "$pack_dir/shared/AGENTS.md" "$PROJECT_DIR/AGENTS.md"
+      fi
       ;;
   esac
 }
@@ -1015,7 +1118,7 @@ plan_action() {
 
 install_file() {
   local pack_id="$1" tool="$2" scope="$3" src="$4" dst="$5" project_key="$6"
-  local parent backup_dir backup_path checksum now
+  local parent backup_dir backup_path checksum now tracked_checksum="" current_checksum="" row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed
   parent="${dst%/*}"
   now="$(date +%Y%m%d-%H%M%S)"
   backup_dir="$STATE_HOME/backups/$now"
@@ -1025,7 +1128,19 @@ install_file() {
       printf 'same    %s\n' "$dst"
       return 0
     fi
-    if ! has_marker "$dst" "$pack_id" && [ "$FORCE" -ne 1 ] && [ "${ALLOW_TRACKED_OVERWRITE:-0}" -ne 1 ]; then
+    if [ -f "$STATE_FILE" ]; then
+      while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
+        [ "$row_pack" = "$pack_id" ] || continue
+        [ "$row_tool" = "$tool" ] || continue
+        [ "$row_scope" = "$scope" ] || continue
+        [ "$row_project" = "$project_key" ] || continue
+        [ "$row_target" = "$dst" ] || continue
+        tracked_checksum="$row_checksum"
+        break
+      done < "$STATE_FILE"
+    fi
+    [ -z "$tracked_checksum" ] || current_checksum="$(checksum_file "$dst")"
+    if ! has_marker "$dst" "$pack_id" && [ "$FORCE" -ne 1 ] && [ "${ALLOW_TRACKED_OVERWRITE:-0}" -ne 1 ] && { [ -z "$tracked_checksum" ] || [ "$current_checksum" != "$tracked_checksum" ]; }; then
       printf 'skip    %s  (exists; use --force to overwrite)\n' "$dst"
       return 0
     fi
@@ -1042,6 +1157,78 @@ install_file() {
   drop_state_record "$pack_id" "$tool" "$scope" "$project_key" "$dst"
   printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$pack_id" "$tool" "$scope" "$project_key" "$dst" "$checksum" "$backup_path" "$now" >> "$STATE_FILE"
   printf 'write   %s\n' "$dst"
+}
+
+install_codex_plugin_config() {
+  local pack_id="$1" scope="$2" project_key="$3" dst tmp old_allow
+  dst="$(codex_config_path)"
+  tmp="$(mktemp "/tmp/vibekit-codex-config.XXXXXX")"
+  merge_codex_plugin_config "$dst" "$pack_id" > "$tmp"
+  old_allow="$ALLOW_TRACKED_OVERWRITE"
+  ALLOW_TRACKED_OVERWRITE=1
+  install_file "$pack_id" codex "$scope" "$tmp" "$dst" "$project_key"
+  ALLOW_TRACKED_OVERWRITE="$old_allow"
+  sync_codex_plugin_cache "$pack_id"
+  update_state_checksum_for_target "$dst" "$(checksum_file "$dst")"
+  rm -f "$tmp"
+}
+
+sync_codex_plugin_cache() {
+  local pack_id="$1" selector output
+  selector="$(codex_plugin_selector "$pack_id")"
+  if ! command -v codex >/dev/null 2>&1; then
+    printf 'note    codex command not found; run: codex plugin add %s\n' "$selector"
+    return 0
+  fi
+  if output="$(codex plugin add "$selector" 2>&1)"; then
+    printf 'codex   installed plugin %s\n' "$selector"
+  else
+    printf 'note    could not install Codex plugin cache for %s\n' "$selector"
+    printf '        run: codex plugin add %s\n' "$selector"
+    [ -z "$output" ] || printf '        %s\n' "$output"
+  fi
+}
+
+remove_codex_plugin_cache() {
+  local pack_id="$1" selector
+  selector="$(codex_plugin_selector "$pack_id")"
+  command -v codex >/dev/null 2>&1 || return 0
+  if codex plugin remove "$selector" >/dev/null 2>&1; then
+    printf 'codex   removed plugin %s\n' "$selector"
+  fi
+}
+
+diff_codex_plugin_config() {
+  local pack_id="$1" dst tmp
+  dst="$(codex_config_path)"
+  tmp="$(mktemp "/tmp/vibekit-codex-config.XXXXXX")"
+  merge_codex_plugin_config "$dst" "$pack_id" > "$tmp"
+  if [ -e "$dst" ]; then
+    if cmp -s "$tmp" "$dst"; then
+      printf 'same    %s\n' "$dst"
+    else
+      printf 'update  %s\n' "$dst"
+    fi
+  else
+    printf 'create  %s\n' "$dst"
+  fi
+  rm -f "$tmp"
+}
+
+rewrite_codex_plugin_config_after_remove() {
+  local pack_id="$1" target="$2" rebuilt checksum
+  rebuilt="$(mktemp "$STATE_HOME/generated.XXXXXX")"
+  strip_codex_plugin_config "$target" "$pack_id" > "$rebuilt"
+  if [ -s "$rebuilt" ]; then
+    cp "$rebuilt" "$target"
+    checksum="$(checksum_file "$target")"
+    record_rewritten_target_checksum "$target" "$checksum"
+    printf 'update  %s\n' "$target"
+  else
+    rm "$target"
+    printf 'remove  %s\n' "$target"
+  fi
+  rm -f "$rebuilt"
 }
 
 cmd_diff_or_install() {
@@ -1072,6 +1259,13 @@ cmd_diff_or_install() {
         install_file "$pack_id" "$tool" "$SCOPE" "$src" "$dst" "$project_key"
       fi
     done
+    if [ "$tool" = "codex" ]; then
+      if [ "$mode" = "diff" ]; then
+        diff_codex_plugin_config "$pack_id"
+      else
+        install_codex_plugin_config "$pack_id" "$SCOPE" "$project_key"
+      fi
+    fi
   done
 }
 
@@ -1086,11 +1280,17 @@ cmd_uninstall() {
   acquire_lock
   ensure_state
 
-  local project_key tmp row_pack row_tool row_scope row_project target checksum backup installed_at current keep
+  local project_key tmp row_pack row_tool row_scope row_project target checksum backup installed_at current keep tool
   project_key="$PROJECT_DIR"
   [ "$SCOPE" = "project" ] || project_key="-"
   tmp="$(mktemp "$STATE_HOME/installed.XXXXXX")"
   MCP_REWRITE_STATE_FILE="$(mktemp "$STATE_HOME/mcp-rewrite.XXXXXX")"
+
+  if ! is_mcp_pack "$pack_id"; then
+    for tool in "${TOOL_LIST[@]}"; do
+      [ "$tool" != "codex" ] || remove_codex_plugin_cache "$pack_id"
+    done
+  fi
 
   while IFS='|' read -r row_pack row_tool row_scope row_project target checksum backup installed_at; do
     [ -n "${row_pack:-}" ] || continue
@@ -1100,7 +1300,9 @@ cmd_uninstall() {
       if [ -f "$target" ]; then
         current="$(checksum_file "$target")"
         if [ "$current" = "$checksum" ]; then
-          if target_has_other_records "$row_pack" "$row_tool" "$row_scope" "$row_project" "$target"; then
+          if is_managed_codex_plugin_config_target "$row_pack" "$row_tool" "$row_scope" "$target"; then
+            rewrite_codex_plugin_config_after_remove "$row_pack" "$target"
+          elif target_has_other_records "$row_pack" "$row_tool" "$row_scope" "$row_project" "$target"; then
             if is_managed_mcp_config_target "$row_pack" "$row_tool" "$row_scope" "$target"; then
               local rebuilt
               rebuilt="$(mktemp "$STATE_HOME/generated.XXXXXX")"
@@ -1110,6 +1312,19 @@ cmd_uninstall() {
                 record_rewritten_target_checksum "$target" "$current"
                 remove_mcp_fragment "$target" "${row_pack#mcp-}"
                 printf 'update  %s\n' "$target"
+              elif [ "$row_tool" = "codex" ]; then
+                strip_toml_mcp_config_server "$target" "${row_pack#mcp-}" > "$rebuilt"
+                if [ -s "$rebuilt" ]; then
+                  cp "$rebuilt" "$target"
+                  current="$(checksum_file "$target")"
+                  record_rewritten_target_checksum "$target" "$current"
+                  remove_mcp_fragment "$target" "${row_pack#mcp-}"
+                  printf 'update  %s\n' "$target"
+                else
+                  rm "$target"
+                  remove_mcp_fragment "$target" "${row_pack#mcp-}"
+                  printf 'remove  %s\n' "$target"
+                fi
               else
                 rm "$target"
                 remove_mcp_fragment "$target" "${row_pack#mcp-}"
@@ -1127,8 +1342,12 @@ cmd_uninstall() {
             printf 'remove  %s\n' "$target"
           fi
         else
-          printf 'skip    %s  (changed since install)\n' "$target"
-          keep=1
+          if is_managed_codex_plugin_config_target "$row_pack" "$row_tool" "$row_scope" "$target"; then
+            rewrite_codex_plugin_config_after_remove "$row_pack" "$target"
+          else
+            printf 'skip    %s  (changed since install)\n' "$target"
+            keep=1
+          fi
         fi
       else
         printf 'gone    %s\n' "$target"
@@ -1176,6 +1395,51 @@ secret_set() {
   [ "$locked_here" -eq 0 ] || release_lock
 }
 
+secret_file_has() {
+  local name="$1" line
+  [ -f "$SECRETS_FILE" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "export $name="*) return 0 ;;
+    esac
+  done < "$SECRETS_FILE"
+  return 1
+}
+
+secret_unset() {
+  local name="$1" tmp line found=0 locked_here=0
+  case "$name" in
+    ''|*[!A-Za-z0-9_]*) die "secret name must contain only A-Z, a-z, 0-9, and _" ;;
+  esac
+  if [ "${LOCK_HELD:-0}" -ne 1 ]; then
+    acquire_lock
+    locked_here=1
+  fi
+  ensure_state
+  tmp="$(mktemp "$STATE_HOME/secrets.XXXXXX")"
+  if [ -f "$SECRETS_FILE" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "export $name="*) found=1 ;;
+        *) printf '%s\n' "$line" >> "$tmp" ;;
+      esac
+    done < "$SECRETS_FILE"
+  fi
+  if [ "$found" -eq 1 ]; then
+    if [ -s "$tmp" ]; then
+      mv "$tmp" "$SECRETS_FILE"
+      chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+    else
+      rm -f "$tmp" "$SECRETS_FILE"
+    fi
+    printf 'removed %s from %s\n' "$name" "$SECRETS_FILE"
+  else
+    rm -f "$tmp"
+    printf 'missing %s in %s\n' "$name" "$SECRETS_FILE"
+  fi
+  [ "$locked_here" -eq 0 ] || release_lock
+}
+
 cmd_secrets() {
   local sub="${1:-}"
   shift || true
@@ -1200,7 +1464,11 @@ cmd_secrets() {
       fi
       secret_set "$name" "$value"
       ;;
-    *) die "usage: vibekit secrets set <NAME> [--value VALUE]" ;;
+    unset|remove|rm)
+      [ "$#" -eq 1 ] || die "usage: vibekit secrets unset <NAME>"
+      secret_unset "$1"
+      ;;
+    *) die "usage: vibekit secrets [set <NAME> [--value VALUE]|unset <NAME>]" ;;
   esac
 }
 
@@ -1245,6 +1513,10 @@ prompt_for_optional_key() {
     printf 'secret  %s already set in environment\n' "$env_name"
     return 0
   fi
+  if secret_file_has "$env_name"; then
+    printf 'secret  %s already stored in %s\n' "$env_name" "$SECRETS_FILE"
+    return 0
+  fi
   if [ "$YES" -eq 1 ]; then
     printf 'secret  %s not set; generated configs will reference it if you set it later\n' "$env_name"
     return 0
@@ -1259,6 +1531,279 @@ prompt_for_optional_key() {
   IFS= read -r value || true
   [ -n "$value" ] || return 0
   secret_set "$env_name" "$value"
+}
+
+prompt_for_open_bridge_model() {
+  local value="" choice="" custom=""
+  if [ -n "${OPENROUTER_MODEL:-}" ]; then
+    printf 'model   OPENROUTER_MODEL already set in environment\n'
+    secret_set OPENROUTER_MODEL "$OPENROUTER_MODEL"
+    return 0
+  fi
+  if secret_file_has OPENROUTER_MODEL; then
+    printf 'model   OPENROUTER_MODEL already stored in %s\n' "$SECRETS_FILE"
+    return 0
+  fi
+  if [ "$YES" -eq 1 ]; then
+    printf 'model   OPENROUTER_MODEL not set; Open Bridge will use its package default unless you set it later\n'
+    return 0
+  fi
+  [ -t 0 ] || return 0
+  printf 'Select OPENROUTER_MODEL:\n' >&2
+  printf '  1) openai/gpt-4o (Open Bridge default)\n' >&2
+  printf '  2) anthropic/claude-3.5-sonnet (Open Bridge README example)\n' >&2
+  printf '  3) custom OpenRouter model id\n' >&2
+  printf 'Choice [1]: ' >&2
+  IFS= read -r choice || true
+  case "$choice" in
+    ''|1) value="openai/gpt-4o" ;;
+    2) value="anthropic/claude-3.5-sonnet" ;;
+    3)
+      printf 'Enter OpenRouter model id: ' >&2
+      IFS= read -r custom || true
+      value="$custom"
+      ;;
+    *) value="$choice" ;;
+  esac
+  [ -n "$value" ] || return 0
+  secret_set OPENROUTER_MODEL "$value"
+}
+
+mcp_secret_names() {
+  local name
+  name="${MCP_AUTH_ENV:-}"
+  if ! normalize_empty "$name" && secret_file_has "$name"; then
+    printf '%s\n' "$name"
+  fi
+  case "${MCP_ID:-}" in
+    open-bridge)
+      if secret_file_has OPENROUTER_MODEL; then
+        printf '%s\n' "OPENROUTER_MODEL"
+      fi
+      ;;
+  esac
+}
+
+purge_mcp_secrets() {
+  local name seen=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case "|$seen|" in
+      *"|$name|"*) continue ;;
+    esac
+    seen="$seen|$name"
+    secret_unset "$name"
+  done <<EOF
+$(mcp_secret_names)
+EOF
+}
+
+maybe_purge_mcp_secrets() {
+  local names="" answer=""
+  names="$(mcp_secret_names | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  [ -n "$names" ] || return 0
+  if [ "$PURGE_SECRETS" -eq 1 ]; then
+    purge_mcp_secrets
+    return 0
+  fi
+  if [ "$YES" -eq 1 ] || [ ! -t 0 ]; then
+    printf 'secret  kept stored secrets for %s: %s\n' "$MCP_ID" "$names"
+    printf '        run: vibekit mcp uninstall %s --purge-secrets\n' "$MCP_ID"
+    return 0
+  fi
+  printf 'Stored secrets for %s: %s\n' "$MCP_ID" "$names" >&2
+  printf 'Keep these secrets for future reinstall? [Y/n] ' >&2
+  IFS= read -r answer || true
+  case "$answer" in
+    n|N|no|NO)
+      purge_mcp_secrets
+      ;;
+    *)
+      printf 'secret  kept stored secrets for %s\n' "$MCP_ID"
+      ;;
+  esac
+}
+
+confirm_local_mcp_runtime_install() {
+  local server="$1" answer=""
+  if [ "$YES" -eq 1 ] || [ ! -t 0 ]; then
+    return 0
+  fi
+  printf 'Install managed runtime for %s now? [Y/n] ' "$server" >&2
+  IFS= read -r answer || true
+  case "$answer" in
+    ''|y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+python_supports_open_bridge() {
+  local python_cmd="$1"
+  "$python_cmd" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+find_open_bridge_python() {
+  local candidate
+  for candidate in python3.12 python3.11 python3.10 python3; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if python_supports_open_bridge "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_exec_wrapper() {
+  local path="$1" command="$2" arg
+  shift 2
+  mkdir -p "${path%/*}"
+  printf '#!/usr/bin/env bash\n' > "$path"
+  printf 'exec %q' "$command" >> "$path"
+  for arg in "$@"; do
+    printf ' %q' "$arg" >> "$path"
+  done
+  printf ' "$@"\n' >> "$path"
+  chmod 755 "$path"
+}
+
+write_env_exec_wrapper() {
+  local path="$1" command="$2" arg
+  shift 2
+  mkdir -p "${path%/*}"
+  printf '#!/usr/bin/env bash\n' > "$path"
+  printf '[ ! -f %q ] || . %q\n' "$SECRETS_FILE" "$SECRETS_FILE" >> "$path"
+  printf 'exec %q' "$command" >> "$path"
+  for arg in "$@"; do
+    printf ' %q' "$arg" >> "$path"
+  done
+  printf ' "$@"\n' >> "$path"
+  chmod 755 "$path"
+}
+
+write_open_bridge_launcher() {
+  local target="$1"
+  write_env_exec_wrapper "$(mcp_runtime_launcher_path open-bridge)" "$target"
+}
+
+find_uv_command() {
+  local server="$1" candidate=""
+  candidate="$(mcp_runtime_uv_bin_dir "$server")/uv"
+  if [ -x "$candidate" ]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  candidate="$(command -v uv 2>/dev/null || true)"
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+confirm_uv_install() {
+  local answer=""
+  if [ "$YES" -eq 1 ] || [ ! -t 0 ]; then
+    return 0
+  fi
+  printf 'Install managed uv runtime for open-bridge now? [Y/n] ' >&2
+  IFS= read -r answer || true
+  case "$answer" in
+    ''|y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_managed_uv() {
+  local server="$1" install_dir installer_tmp uv_path
+  install_dir="$(mcp_runtime_uv_bin_dir "$server")"
+  mkdir -p "$install_dir"
+  confirm_uv_install || die "managed uv install canceled"
+  installer_tmp="$(mktemp "${TMPDIR:-/tmp}/vibekit-uv-installer.XXXXXX")"
+  if command -v curl >/dev/null 2>&1; then
+    printf 'download %s\n' "uv installer"
+    curl -LsSf https://astral.sh/uv/install.sh -o "$installer_tmp" || die "failed to download uv installer"
+  elif command -v wget >/dev/null 2>&1; then
+    printf 'download %s\n' "uv installer"
+    wget -qO "$installer_tmp" https://astral.sh/uv/install.sh || die "failed to download uv installer"
+  else
+    rm -f "$installer_tmp"
+    die "managed uv install requires curl or wget"
+  fi
+  printf 'install  %s\n' "uv"
+  env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$install_dir" sh "$installer_tmp" || {
+    rm -f "$installer_tmp"
+    die "failed to install uv"
+  }
+  rm -f "$installer_tmp"
+  uv_path="$install_dir/uv"
+  [ -x "$uv_path" ] || die "uv installer completed but binary missing: $uv_path"
+  printf 'runtime  %s\n' "$uv_path"
+}
+
+ensure_open_bridge_runtime_with_uv() {
+  local server="$1" uv_path="$2" runtime_bin tool_dir bin_dir
+  runtime_bin="$(mcp_runtime_bin_path "$server")"
+  tool_dir="$(mcp_runtime_uv_tool_dir "$server")"
+  bin_dir="$(mcp_runtime_bin_dir "$server")"
+  mkdir -p "$tool_dir" "$bin_dir"
+  printf 'install  %s via %s\n' "openrouter-mcp-bridge" "$uv_path"
+  UV_TOOL_DIR="$tool_dir" UV_TOOL_BIN_DIR="$bin_dir" "$uv_path" tool install --python 3.10 openrouter-mcp-bridge || die "failed to install openrouter-mcp-bridge with uv"
+  [ -x "$runtime_bin" ] || die "uv installed open-bridge but binary missing: $runtime_bin"
+  write_open_bridge_launcher "$runtime_bin"
+  printf 'runtime  %s\n' "$(mcp_runtime_launcher_path "$server")"
+}
+
+ensure_open_bridge_runtime() {
+  local runtime_root venv_dir python_bin runtime_bin managed_bin launcher_bin installer_py uv_path
+  runtime_root="$(mcp_runtime_root open-bridge)"
+  venv_dir="$(mcp_runtime_venv_dir open-bridge)"
+  python_bin="$(mcp_runtime_python_path open-bridge)"
+  runtime_bin="$(mcp_runtime_bin_path open-bridge)"
+  managed_bin="$(mcp_runtime_venv_bin_path open-bridge)"
+  launcher_bin="$(mcp_runtime_launcher_path open-bridge)"
+
+  if [ -x "$runtime_bin" ] && [ "$FORCE" -ne 1 ]; then
+    write_open_bridge_launcher "$runtime_bin"
+    printf 'runtime  %s\n' "$launcher_bin"
+    return 0
+  fi
+
+  confirm_local_mcp_runtime_install open-bridge || die "open-bridge runtime install canceled"
+
+  mkdir -p "$runtime_root"
+  if installer_py="$(find_open_bridge_python 2>/dev/null || true)" && [ -n "$installer_py" ]; then
+    if [ ! -x "$python_bin" ]; then
+      printf 'create  %s  (using %s)\n' "$venv_dir" "$installer_py"
+      "$installer_py" -m venv "$venv_dir" || die "failed to create virtualenv for open-bridge"
+    fi
+
+    printf 'install  %s\n' "openrouter-mcp-bridge"
+    "$python_bin" -m pip install --upgrade openrouter-mcp-bridge || die "failed to install openrouter-mcp-bridge"
+    [ -x "$managed_bin" ] || die "open-bridge runtime installed but binary missing: $managed_bin"
+    write_exec_wrapper "$runtime_bin" "$managed_bin"
+    write_open_bridge_launcher "$runtime_bin"
+    printf 'runtime  %s\n' "$launcher_bin"
+    return 0
+  fi
+
+  uv_path="$(find_uv_command open-bridge 2>/dev/null || true)"
+  if [ -z "$uv_path" ]; then
+    install_managed_uv open-bridge
+    uv_path="$(find_uv_command open-bridge 2>/dev/null || true)"
+  fi
+  [ -n "$uv_path" ] || die "open-bridge runtime install requires Python 3.10+ or uv"
+  ensure_open_bridge_runtime_with_uv open-bridge "$uv_path"
+}
+
+ensure_local_mcp_runtime() {
+  local server="$1"
+  case "$server" in
+    open-bridge) ensure_open_bridge_runtime ;;
+  esac
 }
 
 normalize_empty() {
@@ -1306,6 +1851,44 @@ command_to_json_array() {
   printf ']'
 }
 
+effective_mcp_command() {
+  case "$MCP_ID" in
+    open-bridge) mcp_runtime_launcher_path "$MCP_ID" ;;
+    *) printf '%s' "$MCP_COMMAND" ;;
+  esac
+}
+
+effective_mcp_args_csv() {
+  case "$MCP_ID" in
+    open-bridge) printf '%s' '-' ;;
+    *) printf '%s' "$MCP_ARGS_CSV" ;;
+  esac
+}
+
+local_mcp_env_fragment_json() {
+  local tool="$1" env_name="$2"
+  [ "${MCP_ID:-}" != "open-bridge" ] || return 0
+  normalize_empty "$env_name" && return 0
+  case "$tool" in
+    claude)
+      cat <<EOF
+,
+      "env": {
+        "$env_name": "\${$env_name}"
+      }
+EOF
+      ;;
+    opencode)
+      cat <<EOF
+,
+      "environment": {
+        "$env_name": "{env:$env_name}"
+      }
+EOF
+      ;;
+  esac
+}
+
 mcp_target_path() {
   local tool="$1" scope="$2"
   case "$tool:$scope" in
@@ -1313,8 +1896,8 @@ mcp_target_path() {
     claude:global) return 1 ;;
     opencode:project) printf '%s/opencode.json' "$PROJECT_DIR" ;;
     opencode:global) printf '%s/opencode/opencode.json' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
-    codex:project) printf '%s/.codex/config.toml' "$PROJECT_DIR" ;;
-    codex:global) printf '%s/.codex/config.toml' "$HOME" ;;
+    codex:project) codex_config_path ;;
+    codex:global) codex_config_path ;;
     *) return 1 ;;
   esac
 }
@@ -1355,6 +1938,79 @@ is_json_mcp_tool() {
   esac
 }
 
+is_toml_mcp_tool() {
+  case "$1" in
+    codex) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_managed_codex_plugin_config_target() {
+  local pack_id="$1" tool="$2" scope="$3" target="$4"
+  is_mcp_pack "$pack_id" && return 1
+  [ "$tool" = "codex" ] || return 1
+  case "$scope" in project|global) ;; *) return 1 ;; esac
+  [ "$target" = "$(codex_config_path)" ]
+}
+
+toml_string_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_codex_plugin_config_fragment() {
+  local pack_id="$1" marketplace selector root
+  marketplace="$(codex_marketplace_name)"
+  selector="$(codex_plugin_selector "$pack_id")"
+  root="$(toml_string_escape "$(codex_marketplace_root)")"
+  cat <<EOF
+[marketplaces.$marketplace]
+source_type = "local"
+source = "$root"
+
+[plugins."$selector"]
+enabled = true
+EOF
+}
+
+strip_codex_plugin_config() {
+  local current_path="$1" pack_id="$2"
+  perl -0777 -e '
+    my ($current_path, $marketplace, $selector) = @ARGV;
+    open my $cfh, "<", $current_path or die $!;
+    local $/;
+    my $current = <$cfh>;
+    close $cfh;
+    my $market = quotemeta("marketplaces.$marketplace");
+    my $plugin = quotemeta("plugins.\"$selector\"");
+    for my $section ($market, $plugin) {
+      $current =~ s{
+        ^\[$section(?:\.[^\]\r\n]+)?\]\R
+        (?:
+          (?!^\[)[^\r\n]*(?:\R|$)
+        )*
+      }{}gmx;
+    }
+    $current =~ s/\s+\z//s;
+    print $current;
+    print "\n" if length($current);
+  ' "$current_path" "$(codex_marketplace_name)" "$(codex_plugin_selector "$pack_id")"
+}
+
+merge_codex_plugin_config() {
+  local current_path="$1" pack_id="$2" stripped
+  if [ -e "$current_path" ]; then
+    stripped="$(mktemp "/tmp/vibekit-codex-strip.XXXXXX")"
+    strip_codex_plugin_config "$current_path" "$pack_id" > "$stripped"
+    if [ -s "$stripped" ]; then
+      cat "$stripped"
+      printf '\n'
+    fi
+    rm -f "$stripped"
+  fi
+  write_codex_plugin_config_fragment "$pack_id"
+  printf '\n'
+}
+
 merge_json_mcp_config() {
   local tool="$1" current_path="$2" env_name="$3"
   local generated
@@ -1386,9 +2042,63 @@ merge_json_mcp_config() {
   rm -f "$generated"
 }
 
+merge_toml_mcp_config() {
+  local current_path="$1" env_name="$2" generated
+  generated="$(mktemp "$STATE_HOME/generated-toml.XXXXXX")"
+  write_mcp_config codex "$env_name" > "$generated"
+  if ! perl -0777 -e '
+    my ($current_path, $generated_path, $server) = @ARGV;
+    open my $cfh, "<", $current_path or die $!;
+    local $/;
+    my $current = <$cfh>;
+    close $cfh;
+    open my $gfh, "<", $generated_path or die $!;
+    my $generated = <$gfh>;
+    close $gfh;
+    my $quoted = quotemeta($server);
+    $current =~ s{
+      ^\[mcp_servers\.$quoted(?:\.[^\]\r\n]+)?\]\R
+      (?:
+        (?!^\[)[^\r\n]*(?:\R|$)
+      )*
+    }{}gmx;
+    $current =~ s/\s+\z/\n/s;
+    print $current;
+    print "\n" if length($current) && $current !~ /\n\n\z/s;
+    print $generated;
+  ' "$current_path" "$generated" "$MCP_ID"; then
+    rm -f "$generated"
+    return 1
+  fi
+  rm -f "$generated"
+}
+
+strip_toml_mcp_config_server() {
+  local current_path="$1" server="$2"
+  perl -0777 -e '
+    my ($current_path, $server) = @ARGV;
+    open my $cfh, "<", $current_path or die $!;
+    local $/;
+    my $current = <$cfh>;
+    close $cfh;
+    my $quoted = quotemeta($server);
+    $current =~ s{
+      ^\[mcp_servers\.$quoted(?:\.[^\]\r\n]+)?\]\R
+      (?:
+        (?!^\[)[^\r\n]*(?:\R|$)
+      )*
+    }{}gmx;
+    $current =~ s/\s+\z//s;
+    print $current;
+    print "\n" if length($current);
+  ' "$current_path" "$server"
+}
+
 write_mcp_entry() {
   local tool="$1" env_name="$2"
-  local server="$MCP_ID" kind="$MCP_KIND" endpoint="$MCP_ENDPOINT" command="$MCP_COMMAND" args_csv="$MCP_ARGS_CSV" auth_scheme="$MCP_AUTH_SCHEME" header_name="$MCP_HEADER_NAME"
+  local server="$MCP_ID" kind="$MCP_KIND" endpoint="$MCP_ENDPOINT" command args_csv auth_scheme="$MCP_AUTH_SCHEME" header_name="$MCP_HEADER_NAME"
+  command="$(effective_mcp_command)"
+  args_csv="$(effective_mcp_args_csv)"
   if [ "$auth_scheme" = "bearer-token" ] && normalize_empty "$header_name"; then
     header_name="Authorization"
   fi
@@ -1428,7 +2138,7 @@ EOF
     "$server": {
       "type": "stdio",
       "command": "$command",
-      "args": $(csv_to_json_array "$args_csv")
+      "args": $(csv_to_json_array "$args_csv")$(local_mcp_env_fragment_json claude "$env_name")
     }
 EOF
       fi
@@ -1477,7 +2187,7 @@ EOF
         cat <<EOF
     "$server": {
       "type": "local",
-      "command": $(command_to_json_array "$command" "$args_csv"),
+      "command": $(command_to_json_array "$command" "$args_csv")$(local_mcp_env_fragment_json opencode "$env_name"),
       "enabled": true
     }
 EOF
@@ -1634,19 +2344,23 @@ remove_mcp_fragment() {
   rmdir "$parent" 2>/dev/null || true
 }
 
-update_mcp_state_checksum_for_target() {
+update_state_checksum_for_target() {
   local target="$1" checksum="$2"
   local tmp row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed
   ensure_state
   tmp="$(mktemp "$STATE_HOME/installed.XXXXXX")"
   while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
     [ -n "${row_pack:-}" ] || continue
-    if is_mcp_pack "$row_pack" && [ "$row_target" = "$target" ]; then
+    if [ "$row_target" = "$target" ]; then
       row_checksum="$checksum"
     fi
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$row_pack" "$row_tool" "$row_scope" "$row_project" "$row_target" "$row_checksum" "$row_backup" "$row_installed" >> "$tmp"
   done < "$STATE_FILE"
   mv "$tmp" "$STATE_FILE"
+}
+
+update_mcp_state_checksum_for_target() {
+  update_state_checksum_for_target "$@"
 }
 
 record_rewritten_target_checksum() {
@@ -1674,10 +2388,8 @@ apply_recorded_mcp_target_checksums() {
   tmp="$(mktemp "$STATE_HOME/installed.XXXXXX")"
   while IFS='|' read -r row_pack row_tool row_scope row_project row_target row_checksum row_backup row_installed; do
     [ -n "${row_pack:-}" ] || continue
-    if is_mcp_pack "$row_pack"; then
-      new_checksum="$(rewritten_target_checksum "$row_target" 2>/dev/null || true)"
-      [ -z "$new_checksum" ] || row_checksum="$new_checksum"
-    fi
+    new_checksum="$(rewritten_target_checksum "$row_target" 2>/dev/null || true)"
+    [ -z "$new_checksum" ] || row_checksum="$new_checksum"
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$row_pack" "$row_tool" "$row_scope" "$row_project" "$row_target" "$row_checksum" "$row_backup" "$row_installed" >> "$tmp"
   done < "$STATE_FILE"
   mv "$tmp" "$STATE_FILE"
@@ -1700,23 +2412,32 @@ manual_mcp_hint() {
         esac
       else
         printf '  claude mcp add --transport stdio %s -- %s %s\n' "$MCP_ID" "$MCP_COMMAND" "${MCP_ARGS_CSV//,/ }"
+        normalize_empty "$env_name" || printf '  and set %s in your shell before starting Claude, or add it under the server env block\n' "$env_name"
       fi
       ;;
     opencode)
       printf '  add mcp.%s to opencode.json\n' "$MCP_ID"
-      case "$auth_scheme" in
-        bearer-token) normalize_empty "$env_name" || printf '  set header %s to Bearer {env:%s}\n' "$header_name" "$env_name" ;;
-        header-env) normalize_empty "$env_name" || printf '  set header %s from {env:%s}\n' "$header_name" "$env_name" ;;
-        oauth) printf '  then run: opencode mcp auth %s\n' "$MCP_ID" ;;
-      esac
+      if [ "$MCP_KIND" = "remote" ]; then
+        case "$auth_scheme" in
+          bearer-token) normalize_empty "$env_name" || printf '  set header %s to Bearer {env:%s}\n' "$header_name" "$env_name" ;;
+          header-env) normalize_empty "$env_name" || printf '  set header %s from {env:%s}\n' "$header_name" "$env_name" ;;
+          oauth) printf '  then run: opencode mcp auth %s\n' "$MCP_ID" ;;
+        esac
+      else
+        normalize_empty "$env_name" || printf '  set environment.%s to {env:%s}\n' "$env_name" "$env_name"
+      fi
       ;;
     codex)
       printf '  add [mcp_servers.%s] to config.toml\n' "$MCP_ID"
-      case "$auth_scheme" in
-        bearer-token) normalize_empty "$env_name" || printf '  set bearer_token_env_var = "%s"\n' "$env_name" ;;
-        header-env) normalize_empty "$env_name" || printf '  set env_http_headers.%s = "%s"\n' "$header_name" "$env_name" ;;
-        oauth) printf '  then run: codex mcp login %s\n' "$MCP_ID" ;;
-      esac
+      if [ "$MCP_KIND" = "remote" ]; then
+        case "$auth_scheme" in
+          bearer-token) normalize_empty "$env_name" || printf '  set bearer_token_env_var = "%s"\n' "$env_name" ;;
+          header-env) normalize_empty "$env_name" || printf '  set env_http_headers.%s = "%s"\n' "$header_name" "$env_name" ;;
+          oauth) printf '  then run: codex mcp login %s\n' "$MCP_ID" ;;
+        esac
+      else
+        normalize_empty "$env_name" || printf '  export %s before starting Codex so the stdio MCP inherits it\n' "$env_name"
+      fi
       ;;
   esac
 }
@@ -1740,6 +2461,8 @@ install_generated_file() {
         tracked_checksum="$managed_target_checksum"
       elif is_json_mcp_tool "$generator_tool" && is_managed_mcp_config_target "$pack_id" "$tool" "$scope" "$dst" && merge_json_mcp_config "$generator_tool" "$dst" "$env_name" > "$tmp"; then
         merged_existing=1
+      elif is_toml_mcp_tool "$generator_tool" && is_managed_mcp_config_target "$pack_id" "$tool" "$scope" "$dst" && merge_toml_mcp_config "$dst" "$env_name" > "$tmp"; then
+        merged_existing=1
       else
         manual_mcp_hint "$tool" "$env_name"
         rm -f "$tmp"
@@ -1749,6 +2472,8 @@ install_generated_file() {
     current="$(checksum_file "$dst")"
     if [ "$current" != "$tracked_checksum" ] && [ "$FORCE" -ne 1 ]; then
       if is_json_mcp_tool "$generator_tool" && is_managed_mcp_config_target "$pack_id" "$tool" "$scope" "$dst" && merge_json_mcp_config "$generator_tool" "$dst" "$env_name" > "$tmp"; then
+        merged_existing=1
+      elif is_toml_mcp_tool "$generator_tool" && is_managed_mcp_config_target "$pack_id" "$tool" "$scope" "$dst" && merge_toml_mcp_config "$dst" "$env_name" > "$tmp"; then
         merged_existing=1
       else
         printf 'skip    %s  (changed since vibekit install; use --force to overwrite)\n' "$dst"
@@ -1800,6 +2525,8 @@ cmd_mcp_install() {
   normalize_empty "$env_name" && env_name="$MCP_AUTH_ENV"
   if [ "$mode" = "install" ]; then
     prompt_for_optional_key "$env_name" "$MCP_SETUP_URL"
+    [ "$MCP_ID" != "open-bridge" ] || prompt_for_open_bridge_model
+    [ "$MCP_KIND" != "local" ] || ensure_local_mcp_runtime "$MCP_ID"
     acquire_lock
     ensure_state
   fi
@@ -1817,7 +2544,15 @@ cmd_mcp_install() {
         if ! write_combined_mcp_config "$tool" "$SCOPE" "$project_key" "$dst" "$MCP_ID" "$env_name" > "$tmp"; then
           write_mcp_config "$tool" "$env_name" > "$tmp"
         fi
-        plan_action "$pack_id" "$tmp" "$dst"
+        if is_managed_mcp_config_target "$pack_id" "$tool" "$SCOPE" "$dst" && [ -e "$dst" ]; then
+          if cmp -s "$tmp" "$dst"; then
+            printf 'same    %s\n' "$dst"
+          else
+            printf 'update  %s\n' "$dst"
+          fi
+        else
+          plan_action "$pack_id" "$tmp" "$dst"
+        fi
         rm -f "$tmp"
       else
         install_generated_file "$pack_id" "$tool" "$SCOPE" "$dst" "$project_key" "$tool" "$env_name"
@@ -1840,6 +2575,7 @@ cmd_mcp_uninstall() {
   shift || true
   mcp_lookup "$server" || die "unknown MCP server: $server"
   cmd_uninstall "mcp-$server" "$@"
+  maybe_purge_mcp_secrets
 }
 
 cmd_mcp() {
