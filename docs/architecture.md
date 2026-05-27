@@ -1,55 +1,80 @@
 # Architecture
 
-Vibekit uses a simple adapter model.
+Vibekit is a local-first Bash CLI that installs assistant workflow content into Claude Code, OpenCode, and Codex. The executable is intentionally self-contained: `bin/vibekit` owns command parsing, install planning, adapter mapping, state tracking, MCP config generation, and self-install behavior.
 
 ```text
-pack content
-  -> install planner
-  -> tool adapter
-  -> assistant-specific files
-  -> state tracking
+repo content
+  -> pack or MCP registry lookup
+  -> adapter target expansion
+  -> diff/install/uninstall action
+  -> checksum-backed state record
 ```
 
-## Core Modules
+## Source Of Truth
 
-- `bin/vibekit`: Bash CLI and installer engine.
-- `packs/`: built-in setup packs with assistant-facing agents, commands, skills, and workflow guidance.
-- `mcp/registry.psv`: MCP metadata used by `vibekit mcp`.
-- `mcp/skills/`: MCP-specific skill overlays installed alongside MCP config.
-- state directory: `${XDG_STATE_HOME:-~/.local/state}/vibekit`.
+- `bin/vibekit`: CLI runtime and installer engine.
+- `packs/core-vibe-coder/pack.env`: built-in pack metadata.
+- `packs/core-vibe-coder/{claude,opencode,codex}/`: assistant-specific command and agent payloads.
+- `packs/core-vibe-coder/skills/`: portable workflow skills installed for all supported assistants.
+- `packs/core-vibe-coder/shared/AGENTS.md`: project context file used by OpenCode and Codex project installs.
+- `mcp/registry.psv`: MCP server registry used by `vibekit mcp`.
+- `mcp/skills/mcp-*/`: MCP-specific skill overlays installed alongside generated MCP config.
+- `README.md`: user-facing quick start, command reference, and license notice.
+- `docs/`: maintainer-facing architecture, codebase summary, and review notes.
 
-## Current Adapters
+## Core Flows
 
-- Claude Code: Markdown agents, commands, skills, and `.mcp.json` for project MCP.
-- OpenCode: Markdown agents, commands, skills, `AGENTS.md`, and `opencode.json` for MCP.
-- Codex: a local Codex plugin marketplace under `${XDG_DATA_HOME:-~/.local/share}/vibekit/codex-marketplaces/vibekit/`, plugin commands, Markdown agents, portable skills, project `AGENTS.md`, and `~/.codex/config.toml` for MCP and plugin enablement.
+`vibekit diff` expands pack files for the selected tools and prints the action that install would take. It does not acquire the state lock and should remain read-only.
 
-## Self-Install Design
+`vibekit install` expands the same file list, writes files, records checksums, and backs up overwritten files under `${XDG_STATE_HOME:-~/.local/state}/vibekit/backups/<timestamp>/`.
 
-- `vibekit self install` copies `bin/`, `packs/`, and `mcp/` into `${XDG_DATA_HOME:-~/.local/share}/vibekit/self/<id>/` so the installed CLI does not depend on the original clone.
-- The launcher at `<bin-dir>/vibekit` stores `source` and `runtime` markers, and the runtime metadata stores the launcher target path.
-- Shell PATH updates are shell-specific: `zsh` uses `~/.zprofile`, `bash` uses `~/.bash_profile` or `~/.profile`, `fish` uses `${XDG_CONFIG_HOME:-~/.config}/fish/config.fish`, `nu` uses `${XDG_CONFIG_HOME:-~/.config}/nushell/config.nu`, and `pwsh` uses `~/.config/powershell/Microsoft.PowerShell_profile.ps1`.
-- `vibekit self status` and `vibekit doctor` report the managed target, runtime, startup file, and a fresh-shell probe. When `--bin-dir` is omitted they prefer a Vibekit-managed launcher already on `PATH`.
+`vibekit uninstall` reads `${XDG_STATE_HOME:-~/.local/state}/vibekit/installed.tsv` and removes only files whose current checksum still matches the install record. Changed files are kept.
+
+`vibekit status` compares tracked checksums with current files and reports `ok`, `changed`, or `missing`.
+
+`vibekit self install` copies `bin/`, `packs/`, and `mcp/` into `${XDG_DATA_HOME:-~/.local/share}/vibekit/self/<id>/`, then writes a launcher at `<bin-dir>/vibekit` so the command can survive moving or deleting the original clone.
+
+## State And Safety
+
+- State lives under `${XDG_STATE_HOME:-~/.local/state}/vibekit`.
+- Installs are serialized with a lock directory at `lock`.
+- `installed.tsv` stores pack id, tool, scope, project key, target path, checksum, backup path, and install timestamp.
+- `secrets.env` stores local secrets as shell exports with file mode `600` where supported.
+- Existing user files are skipped unless they are already Vibekit-managed, contain a matching pack marker, or `--force` is passed.
+- MCP config fragments are cached under `mcp-fragments/` so multiple MCP servers can share one assistant config file and uninstall can rebuild the remaining servers.
+
+## Adapter Targets
+
+Claude Code project installs write Markdown agents, commands, skills, and `CLAUDE.md` under `.claude/`. Project MCP config is `.mcp.json`. Global Claude MCP config is not written directly because Claude global MCP state is managed by Claude itself.
+
+OpenCode project installs write Markdown agents, commands, skills, and shared `AGENTS.md` into the repository. Global installs use `${XDG_CONFIG_HOME:-~/.config}/opencode`. MCP config is `opencode.json`.
+
+Codex installs create a local marketplace under `${XDG_DATA_HOME:-~/.local/share}/vibekit/codex-marketplaces/vibekit/` and place the pack as a Codex plugin. Vibekit merges `[marketplaces.vibekit]` and `[plugins."core-vibe-coder@vibekit"]` into `~/.codex/config.toml`, then tries `codex plugin add core-vibe-coder@vibekit` when the `codex` command is available. Project scope also writes `AGENTS.md` into the target project.
 
 ## MCP Design
 
-- MCP registry entries define transport, auth scheme, credential env var, setup URL, and docs URL.
-- `vibekit mcp install` generates assistant-specific MCP config from registry metadata. Codex MCP config is written to `~/.codex/config.toml` because the Codex CLI does not read project `.codex/config.toml`.
-- Local stdio MCPs can also carry credential env vars so Vibekit can prompt once and emit env references for assistants that support them.
-- Local MCPs can also bootstrap managed runtimes under `${XDG_DATA_HOME:-~/.local/share}/vibekit/mcp-runtimes/` so generated configs can point at stable absolute launchers instead of depending on shell `PATH`. For Python tools this can include either a managed virtualenv or a managed `uv` installation plus `uv tool install`.
-- Each MCP can also ship a matching `mcp-*` skill under `mcp/skills/`.
-- MCP skill files are installed into each assistant's skill directory so they can be loaded explicitly at task time.
-- The core planning, research, brainstorming, implementation, debugging, and review skills and agents point users toward these `mcp-*` skills when external context or second-pass reasoning is relevant.
+Registry rows define the MCP id, display name, local or remote kind, endpoint or command, auth scheme, credential env var, setup URL, and docs URL.
 
-## Codex Plugin Design
+Generated MCP config is adapter-specific:
 
-- Pack installs create a local marketplace with `.agents/plugins/marketplace.json` and `plugins/core-vibe-coder/.codex-plugin/plugin.json`.
-- The Codex plugin contains `commands/`, `agents/`, `skills/`, and supplemental rules so slash commands and specialists are discoverable through Codex's plugin loader.
-- Vibekit merges `[marketplaces.vibekit]` and `[plugins."core-vibe-coder@vibekit"]` into `~/.codex/config.toml`, then runs `codex plugin add core-vibe-coder@vibekit` to populate Codex's plugin cache.
-- Project scope still writes `AGENTS.md` into the repository because that is the durable project-context surface Codex reads during normal coding sessions.
+- Claude uses JSON under `mcpServers`.
+- OpenCode uses JSON under `mcp`.
+- Codex uses TOML under `[mcp_servers.<id>]` in `~/.codex/config.toml`.
 
-## Next Adapter Work
+Remote MCPs can use header env vars, bearer token env vars, OAuth, or no auth. Local MCPs can emit command arrays and optional environment references. The `open-bridge` MCP is special: Vibekit can bootstrap a managed runtime under `${XDG_DATA_HOME:-~/.local/share}/vibekit/mcp-runtimes/open-bridge/` and generates a launcher that sources `secrets.env` before starting the server.
+
+## Current Pack Shape
+
+`core-vibe-coder` currently ships:
+
+- 12 specialist agents per assistant.
+- 10 slash-style commands per assistant: `brainstorm`, `code`, `deploy`, `docs`, `fix`, `plan`, `research`, `review`, `security`, and `test`.
+- 13 portable skills covering planning, implementation, review, testing, debugging, documentation, research, security, DevOps, database changes, UI/UX, orchestration, and brainstorming.
+- 6 MCP skill overlays: `context7`, `figma`, `github`, `open-bridge`, `playwright`, and `sentry`.
+
+## Known Extension Points
 
 - Git URL pack installation.
-- Pack manifest validation.
-- Copilot/VS Code adapter.
+- Pack manifest validation beyond `pack.env`.
+- Additional assistant adapters such as Copilot or VS Code.
+- Stronger automated test coverage for install, uninstall, and MCP merge behavior.

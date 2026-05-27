@@ -2,17 +2,35 @@
   <img src="assets/vibekit-banner.svg" alt="Animated Vibekit banner" width="100%" />
 </p>
 
-# Vibekit
+<h1 align="center">Vibekit</h1>
 
-<p align="center"><strong>CLI-first setup manager for vibe coders.</strong></p>
+<p align="center"><strong>Local-first setup manager for coding assistants, workflow packs, MCP servers, and clean teardown.</strong></p>
 
-<p align="center">Local-first pack, MCP, and self-install workflow for Claude Code, OpenCode, and Codex.</p>
+<p align="center">
+  Install once. Diff before writing. Track every file. Cleanly uninstall when the experiment is done.
+</p>
 
 <p align="center">
   <img alt="Status early MVP" src="https://img.shields.io/badge/status-early_mvp-7c3aed?style=for-the-badge" />
   <img alt="Runtime Bash" src="https://img.shields.io/badge/runtime-bash-111827?style=for-the-badge&logo=gnubash&logoColor=white" />
   <img alt="Platform macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-0f172a?style=for-the-badge" />
+  <img alt="Assistants Claude OpenCode Codex" src="https://img.shields.io/badge/assistants-Claude%20Code%20%7C%20OpenCode%20%7C%20Codex-0f766e?style=for-the-badge" />
+  <a href="https://fossmyanmar.org/"><img alt="FOSS Myanmar free and open source software" src="https://img.shields.io/badge/FOSS-Myanmar-16a34a?style=for-the-badge" /></a>
   <img alt="License personal use only" src="https://img.shields.io/badge/license-personal_use_only-dc2626?style=for-the-badge" />
+</p>
+
+<p align="center">
+  <a href="#quick-start"><strong>Quick Start</strong></a>
+  |
+  <a href="#install-the-cli"><strong>Install</strong></a>
+  |
+  <a href="#clean-uninstall-and-secret-cleanup"><strong>Uninstall</strong></a>
+  |
+  <a href="#mcp"><strong>MCP</strong></a>
+  |
+  <a href="#foss-myanmar"><strong>FOSS Myanmar</strong></a>
+  |
+  <a href="docs/architecture.md"><strong>Architecture</strong></a>
 </p>
 
 > [!IMPORTANT]
@@ -21,7 +39,28 @@
 > Use on company-owned or company-managed devices is not allowed.
 > See `LICENSE` for the full terms.
 
-Vibekit installs and tracks coding-assistant setup packs for Claude Code, OpenCode, and Codex. The MVP is local-first, Bash-based, and safe by default.
+```text
++-----------------------------------------------------------------------------+
+|  Vibekit                                                                    |
++-----------------------------------------------------------------------------+
+|  packs        -> commands, agents, skills, and project operating rules       |
+|  mcp          -> assistant config plus matching mcp-* skills                 |
+|  secrets      -> local state helper, never written into project configs      |
+|  uninstall    -> checksum guarded cleanup with optional secret purge         |
++-----------------------------------------------------------------------------+
+```
+
+Vibekit installs and tracks coding-assistant setup packs for Claude Code, OpenCode, and Codex. The MVP is Bash-based, local-first, and built around one rule: show what will change before writing anything, then remember exactly what was written.
+
+## Why It Exists
+
+| Need | Vibekit answer |
+| --- | --- |
+| Try a serious assistant workflow without hand-copying files | Install the `core-vibe-coder` pack for Claude Code, OpenCode, and Codex. |
+| Keep generated configs understandable | Use `vibekit diff` before install and checksum-backed state after install. |
+| Add MCP servers without remembering every assistant's config shape | Generate Claude, OpenCode, and Codex MCP config from one registry. |
+| Keep secrets out of project files | Store local credentials in `${XDG_STATE_HOME:-~/.local/state}/vibekit/secrets.env`. |
+| Undo cleanly | Use pack uninstall, MCP uninstall, self uninstall, and `--purge-secrets` when credentials should be removed too. |
 
 ## Status
 
@@ -40,8 +79,11 @@ Implemented:
 - Codex adapter
 - MCP installers for clean assistant config files plus matching `mcp-*` skills
 - Local secret storage helper
+- MCP uninstall with optional secret purge
 
 ## Quick Start
+
+Install the CLI launcher, check your environment, preview the pack, then install:
 
 ```bash
 ./bin/vibekit self install
@@ -50,12 +92,19 @@ vibekit diff core-vibe-coder --tools claude,opencode,codex --scope project
 vibekit install core-vibe-coder --tools claude,opencode,codex --scope project
 ```
 
-If you do not want to install a launcher yet, you can still run the repo-local script directly:
+Prefer not to install a launcher yet? Run the repo-local script directly:
 
 ```bash
 ./bin/vibekit doctor --shell zsh
 ./bin/vibekit diff core-vibe-coder --tools claude,opencode,codex --scope project
 ./bin/vibekit install core-vibe-coder --tools claude,opencode,codex --scope project
+```
+
+Add an MCP server and keep the matching assistant skill close by:
+
+```bash
+vibekit mcp diff github --tools claude,opencode,codex --scope project
+vibekit mcp install github --tools claude,opencode,codex --scope project
 ```
 
 ## Install The CLI
@@ -106,6 +155,90 @@ exec zsh -l
 
 Re-run `./bin/vibekit self install` from a newer clone to refresh the installed runtime.
 
+## Install Recipes
+
+Preview before writing:
+
+```bash
+vibekit diff core-vibe-coder --tools claude,opencode,codex --scope project
+vibekit mcp diff context7 --tools claude,opencode,codex --scope project
+```
+
+Install the default workflow pack:
+
+```bash
+vibekit install core-vibe-coder --tools claude,opencode,codex --scope project
+```
+
+Install MCP support with stored local secrets when prompted:
+
+```bash
+vibekit mcp install context7 --tools claude,opencode,codex --scope project
+vibekit mcp install open-bridge --tools claude,opencode,codex --scope project
+```
+
+Store or rotate a secret directly:
+
+```bash
+vibekit secrets set CONTEXT7_API_KEY
+vibekit secrets set OPENROUTER_API_KEY
+vibekit secrets set OPENROUTER_MODEL
+```
+
+## Clean Uninstall And Secret Cleanup
+
+Vibekit has three cleanup layers: installed pack files, installed MCP config/skills, and the self-installed CLI runtime.
+
+Remove the Core Vibe Coder pack from the current project:
+
+```bash
+vibekit uninstall core-vibe-coder --tools claude,opencode,codex --scope project
+```
+
+Remove an MCP server but keep any stored credential for a future reinstall:
+
+```bash
+vibekit mcp uninstall github --tools claude,opencode,codex --scope project
+```
+
+Remove an MCP server and purge its stored secrets non-interactively:
+
+```bash
+vibekit mcp uninstall github --tools claude,opencode,codex --scope project --purge-secrets
+```
+
+Remove one stored secret directly:
+
+```bash
+vibekit secrets unset GITHUB_PAT_TOKEN
+vibekit secrets unset CONTEXT7_API_KEY
+vibekit secrets unset OPENROUTER_API_KEY
+vibekit secrets unset OPENROUTER_MODEL
+```
+
+Secret cleanup guide:
+
+| Goal | Command |
+| --- | --- |
+| Remove MCP config and keep credentials | `vibekit mcp uninstall <server> --tools claude,opencode,codex --scope project` |
+| Remove MCP config and related credentials | `vibekit mcp uninstall <server> --tools claude,opencode,codex --scope project --purge-secrets` |
+| Remove one named secret | `vibekit secrets unset <NAME>` |
+| Remove the Vibekit launcher/runtime | `vibekit self uninstall --shell zsh` |
+
+Remove the user-scoped launcher and copied runtime:
+
+```bash
+vibekit self uninstall --shell zsh
+```
+
+Uninstall safety rules:
+
+- Pack uninstall removes only files whose checksum still matches Vibekit's install record.
+- MCP uninstall rewrites shared config files when other Vibekit-managed MCP servers remain.
+- `--purge-secrets` removes stored MCP-related secrets from `${XDG_STATE_HOME:-~/.local/state}/vibekit/secrets.env`.
+- Self uninstall removes only a Vibekit-managed launcher and runtime.
+- Shell startup files are not aggressively rewritten during self uninstall; remove the `# vibekit:path` block manually if you no longer want the bin dir on `PATH`.
+
 ## Commands
 
 ```bash
@@ -124,6 +257,7 @@ vibekit mcp diff context7
 vibekit mcp install context7
 vibekit mcp uninstall context7
 vibekit mcp install playwright
+vibekit mcp uninstall open-bridge --purge-secrets
 vibekit secrets set CONTEXT7_API_KEY
 vibekit secrets unset CONTEXT7_API_KEY
 ```
@@ -136,6 +270,7 @@ vibekit secrets unset CONTEXT7_API_KEY
 - Installed files are tracked in `${XDG_STATE_HOME:-~/.local/state}/vibekit/installed.tsv`.
 - Uninstall removes only files whose checksum still matches the install record.
 - Secrets are never written into project configs directly.
+- `--purge-secrets` can remove MCP-related local secrets during MCP uninstall.
 
 ## Config Targets
 
@@ -241,6 +376,14 @@ claude mcp add --transport http figma https://mcp.figma.com/mcp
 ## Reference Corpus
 
 The sibling `claude-config` directory is a reference corpus only. It should not be copied wholesale into arbitrary projects because it is Claude-specific, stack-biased, and includes permissive local settings.
+
+## FOSS Myanmar
+
+Vibekit supports the spirit of Free and Open Source Software and links to the FOSS Myanmar community:
+
+- https://fossmyanmar.org/
+
+FOSS Myanmar is a community/site reference for free and open-source software. The legal terms for this repository are still defined by the `LICENSE` file below. To make Vibekit fully open source, replace `LICENSE` with a recognized FOSS license such as MIT, Apache-2.0, GPL-3.0, or AGPL-3.0.
 
 ## License
 
